@@ -6,7 +6,7 @@ OBJECTIVE:
 Transform an unstructured clinical note into a structured representation containing medically relevant information required for clinical understanding and ICD coding preparation.
 
 INPUT:
-A raw clinical note containing free-text medical information such as patient history, symptoms, diagnoses, investigations, procedures and other clinical observations.
+The system will receive a raw unstructured clinical note. The note may contain patient history, symptoms, diagnoses, investigations, treatments, and other medical observations. The clinical note can be long and unstructured, similar to hospital discharge summaries.
 
 TASK:
 Analyze the clinical note and extract only the medically relevant information.
@@ -47,8 +47,8 @@ RULES:
 
 
 EXAMPLES:
-Example 1:
 
+Example 1:
 INPUT:
 58 y/o male presented to the emergency department with fever, productive cough, and shortness of breath for the past 4 days. Patient reports yellow sputum and pleuritic chest pain.
 Past medical history significant for chronic obstructive pulmonary disease (COPD) and hypertension.
@@ -58,41 +58,48 @@ Assessment: Community-acquired pneumonia.
 Patient was started on intravenous ceftriaxone and azithromycin along with supplemental oxygen therapy.
 Patient has a 25-year history of smoking.
 
-
 OUTPUT:
-
 Patient Demographics:
 Age: 58
 Gender: Male
+
 Primary Diagnosis:
 Community-acquired pneumonia
+
 Secondary Diagnoses:
 Not specified
+
 Symptoms:
 Fever
 Productive cough
 Shortness of breath
 Pleuritic chest pain
+
 Duration:
 4 days
+
 Investigations:
 Chest X-ray showing left lower lobe consolidation
 Elevated white blood cell count
 Oxygen saturation 90% on room air
+
 Procedures:
 Intravenous ceftriaxone therapy
 Intravenous azithromycin therapy
 Supplemental oxygen therapy
+
 Comorbidities:
 Chronic obstructive pulmonary disease
 Hypertension
+
 Risk Factors:
 Smoking
+
 Complications:
 Not specified
 
-Example 2:
 
+Example 2:
 INPUT:
 72 y/o female presented to the emergency department with worsening shortness of breath and fatigue for 3 days. Patient reports swelling of both legs and difficulty lying flat at night.
 Past medical history significant for chronic heart failure, hypertension, and type 2 diabetes mellitus.
@@ -103,41 +110,49 @@ Patient was treated with intravenous furosemide and oxygen therapy.
 Patient has a long history of smoking.
 
 OUTPUT:
-
 Patient Demographics:
 Age: 72
 Gender: Female
+
 Primary Diagnosis:
 Acute exacerbation of congestive heart failure
+
 Secondary Diagnoses:
 Atrial fibrillation
+
 Symptoms:
 Shortness of breath
 Fatigue
 Bilateral leg swelling
 Orthopnea
+
 Duration:
 3 days
+
 Investigations:
 Chest X-ray showing cardiomegaly
 Chest X-ray showing pulmonary vascular congestion
 Elevated BNP levels
 ECG showing atrial fibrillation
 Oxygen saturation 89% on room air
+
 Procedures:
 Intravenous furosemide therapy
 Oxygen therapy
+
 Comorbidities:
 Chronic heart failure
 Hypertension
 Type 2 diabetes mellitus
+
 Risk Factors:
 Smoking
+
 Complications:
 Not specified
 
-Example 3
 
+Example 3:
 INPUT:
 65 y/o male presented to the emergency department with high fever, chills, and generalized weakness for the past 2 days. Patient also complained of burning sensation during urination.
 Past medical history significant for type 2 diabetes mellitus and benign prostatic hyperplasia.
@@ -151,29 +166,38 @@ OUTPUT:
 Patient Demographics:
 Age: 65
 Gender: Male
+
 Primary Diagnosis:
 Sepsis secondary to urinary tract infection
+
 Secondary Diagnoses:
 Urinary tract infection
+
 Symptoms:
 Fever
 Chills
 Generalized weakness
 Burning sensation during urination
+
 Duration:
 2 days
+
 Investigations:
 Elevated white blood cell count
 Elevated serum lactate levels
 Urinalysis showing bacteriuria
 Blood cultures positive for Escherichia coli
+
 Procedures:
 Intravenous fluid therapy
 Intravenous antibiotic therapy
+
 Comorbidities:
 Type 2 diabetes mellitus
 Benign prostatic hyperplasia
+
 Risk Factors:
 Not specified
+
 Complications:
 Hypotension
