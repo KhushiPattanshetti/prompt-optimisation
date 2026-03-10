@@ -1,0 +1,20 @@
+# Model checkpoints (never commit weights to git)
+rl_checkpoints/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+.venv
+env/
+
+# LLM prompt artifacts
+llm.json
+llm.txt
+
+# macOS
+.DS_Store
