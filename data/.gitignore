@@ -1,0 +1,5 @@
+*.csv
+*.parquet
+*.json
+!.gitignore
+!download_data.py
