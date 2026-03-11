@@ -10,8 +10,8 @@ from pathlib import Path
 import gdown
 
 # --- Google Drive file IDs (update these when files change) ---
-NOTES_FILE_ID = "REPLACE_WITH_NOTES_FILE_ID"
-DIAGNOSES_FILE_ID = "REPLACE_WITH_DIAGNOSES_FILE_ID"
+NOTES_FILE_ID = "https://drive.google.com/file/d/1UbaMm5bG8Axacwc6MWhhMzZO2PqC6Ibs/view?usp=sharing"
+DIAGNOSES_FILE_ID = "https://drive.google.com/file/d/14N_NjkppC_-xUlvseP_oVxUNmeyrqHT3/view?usp=sharing"
 
 # --- Destination paths (resolved relative to this script) ---
 DATA_DIR = Path(__file__).resolve().parent
