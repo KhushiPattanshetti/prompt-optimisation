@@ -19,20 +19,20 @@ from dataset_svc.store import DatasetStore
 # ------------------------------------------------------------------
 
 NOTES_ROWS = [
-    {"note_id": "N001", "subject_id_x": "S1", "hadm_id": "H1", "text": "Fever and chills."},
-    {"note_id": "N002", "subject_id_x": "S2", "hadm_id": "H2", "text": "Routine visit."},
-    {"note_id": "N003", "subject_id_x": "S3", "hadm_id": "H3", "text": "Follow-up."},
-    {"note_id": "N004", "subject_id_x": "S4", "hadm_id": "H4", "text": "Discharge summary."},
-    {"note_id": "N005", "subject_id_x": "S5", "hadm_id": "H5", "text": "Admission note."},
+    {"note_id": "01-JAN-2024", "subject_id_x": "1001", "hadm_id": "2001", "text": "Fever and chills."},
+    {"note_id": "02-FEB-2024", "subject_id_x": "1002", "hadm_id": "2002", "text": "Routine visit."},
+    {"note_id": "03-MAR-2024", "subject_id_x": "1003", "hadm_id": "2003", "text": "Follow-up."},
+    {"note_id": "04-APR-2024", "subject_id_x": "1004", "hadm_id": "2004", "text": "Discharge summary."},
+    {"note_id": "05-MAY-2024", "subject_id_x": "1005", "hadm_id": "2005", "text": "Admission note."},
 ]
 
 DIAGNOSES_ROWS = [
-    {"note_id": "N001", "seq_num": "1", "icd_code": "A01"},
-    {"note_id": "N001", "seq_num": "2", "icd_code": "B02"},
-    {"note_id": "N002", "seq_num": "1", "icd_code": "C03"},
-    {"note_id": "N003", "seq_num": "1", "icd_code": "D04"},
-    {"note_id": "N003", "seq_num": "2", "icd_code": "E05"},
-    {"note_id": "N003", "seq_num": "3", "icd_code": "F06"},
+    {"note_id": "01-JAN-2024", "seq_num": "1", "icd_code": "A01"},
+    {"note_id": "01-JAN-2024", "seq_num": "2", "icd_code": "B02"},
+    {"note_id": "02-FEB-2024", "seq_num": "1", "icd_code": "C03"},
+    {"note_id": "03-MAR-2024", "seq_num": "1", "icd_code": "D04"},
+    {"note_id": "03-MAR-2024", "seq_num": "2", "icd_code": "E05"},
+    {"note_id": "03-MAR-2024", "seq_num": "3", "icd_code": "F06"},
 ]
 
 
@@ -61,12 +61,12 @@ class TestPipelineSequence:
     """Call get_note, get_gt_codes, get_batch in sequence and validate."""
 
     def test_get_note_returns_correct_text(self, store: DatasetStore) -> None:
-        text = store.get_note("N001")
+        text = store.get_note("01-JAN-2024")
         assert isinstance(text, str)
         assert text == "Fever and chills."
 
     def test_get_gt_codes_returns_correct_codes(self, store: DatasetStore) -> None:
-        codes = store.get_gt_codes("N001")
+        codes = store.get_gt_codes("01-JAN-2024")
         assert isinstance(codes, list)
         assert codes == ["A01", "B02"]
 

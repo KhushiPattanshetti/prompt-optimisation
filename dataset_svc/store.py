@@ -2,10 +2,14 @@
 
 This is the only module permitted to read CSV files.
 All other modules access data through this class.
+
+notes.csv is loaded using a custom line-by-line reader that correctly handles
+multiline text fields. diagnoses.csv is loaded using pd.read_csv().
 """
 
 from __future__ import annotations
 
+import re
 import time
 
 import pandas as pd
@@ -18,24 +22,20 @@ logger = get_logger(__name__)
 class DatasetStore:
     """In-memory store for clinical notes and ICD-10 diagnosis codes.
 
-    Loads notes.csv and diagnoses.csv once at construction time,
-    builds indexed lookups, and exposes read-only access methods.
+    Loads notes.csv via a custom multiline-aware reader and diagnoses.csv
+    via pd.read_csv(), builds indexed lookups, and exposes read-only
+    access methods.
     """
 
     def __init__(self, notes_path: str, diagnoses_path: str) -> None:
-        """Initialise the store by loading and indexing both CSV files.
-
-        Args:
-            notes_path: Filesystem path to notes.csv.
-            diagnoses_path: Filesystem path to diagnoses.csv.
-        """
         self.notes_index: dict[str, str] = {}
         self.gt_codes_index: dict[str, list[str]] = {}
         self.note_ids_list: list[str] = []
         self.loading_time_sec: float = 0.0
 
         start = time.perf_counter()
-        self._load(notes_path, diagnoses_path)
+        self._load_notes(notes_path)
+        self._load_diagnoses(diagnoses_path)
         self.loading_time_sec = round(time.perf_counter() - start, 3)
 
         logger.info(
@@ -45,50 +45,71 @@ class DatasetStore:
             self.loading_time_sec,
         )
 
-    def _load(self, notes_path: str, diagnoses_path: str) -> None:
-        """Load both CSVs and build in-memory indexes.
+    # ------------------------------------------------------------------
+    # Private loading methods
+    # ------------------------------------------------------------------
 
-        Args:
-            notes_path: Filesystem path to notes.csv.
-            diagnoses_path: Filesystem path to diagnoses.csv.
+    def _load_notes(self, notes_path: str) -> None:
+        """Load notes.csv using a custom row-boundary reader.
+
+        notes.csv contains multiline text fields that standard CSV parsers
+        cannot handle correctly. Row boundaries are identified by a regex
+        pattern matching the note_id,subject_id,hadm_id prefix.
+        Duplicate note_ids are deduplicated, keeping only the first occurrence.
         """
-        # --- Load notes.csv ---
         logger.info("Loading notes.csv from %s", notes_path)
         t0 = time.perf_counter()
-        notes_df = pd.read_csv(
-            notes_path,
-            usecols=["note_id", "text"],
-            dtype={"note_id": str, "text": str},
-            engine="c",
-        )
+
+        pattern = re.compile(r"^\d+-[A-Z]+-\d+,\d+,\d+,")
+        current_row: str | None = None
+        seen_note_ids: set[str] = set()
+
+        with open(notes_path, encoding="utf-8") as fh:
+            fh.readline()  # discard header line
+            for line in fh:
+                if pattern.match(line):
+                    if current_row is not None:
+                        self._flush_note_row(current_row, seen_note_ids)
+                    current_row = line
+                else:
+                    if current_row is not None:
+                        current_row += line
+
+        if current_row is not None:
+            self._flush_note_row(current_row, seen_note_ids)
+
+        self.note_ids_list = list(self.notes_index.keys())
         logger.info(
-            "notes.csv loaded | rows=%d | columns=%s | time=%.3fs",
-            len(notes_df),
-            list(notes_df.columns),
+            "notes.csv loaded | unique_notes=%d | time=%.3fs",
+            len(self.notes_index),
             time.perf_counter() - t0,
         )
 
-        # Build notes_index: note_id → text
-        self.notes_index = dict(zip(notes_df["note_id"], notes_df["text"]))
-        self.note_ids_list = list(notes_df["note_id"])
-        del notes_df
+    def _flush_note_row(self, row: str, seen: set[str]) -> None:
+        """Parse a fully-accumulated row string and add it to the index.
 
-        # --- Load diagnoses.csv ---
+        Splits on comma with maxsplit=3 to extract note_id and text,
+        skipping the note if note_id was already seen (deduplication).
+        If the row has fewer than 4 parts, text defaults to empty string.
+        """
+        parts = row.split(",", maxsplit=3)
+        note_id = parts[0].strip()
+        text = parts[3].strip() if len(parts) >= 4 else ""
+        if note_id not in seen:
+            self.notes_index[note_id] = text
+            seen.add(note_id)
+
+    def _load_diagnoses(self, diagnoses_path: str) -> None:
+        """Load diagnoses.csv using pd.read_csv() and build gt_codes_index."""
         logger.info("Loading diagnoses.csv from %s", diagnoses_path)
-        t1 = time.perf_counter()
+        t0 = time.perf_counter()
+
         diag_df = pd.read_csv(
             diagnoses_path,
             usecols=["note_id", "seq_num", "icd_code"],
-            dtype={"note_id": str, "icd_code": str},
+            dtype={"note_id": str, "seq_num": int, "icd_code": str},
             engine="c",
         )
-        logger.info(
-            "diagnoses.csv loaded | rows=%d | time=%.3fs",
-            len(diag_df),
-            time.perf_counter() - t1,
-        )
-
-        # Sort by note_id then seq_num, group into ordered lists
         diag_df = diag_df.sort_values(["note_id", "seq_num"])
         self.gt_codes_index = (
             diag_df.groupby("note_id")["icd_code"]
@@ -98,9 +119,9 @@ class DatasetStore:
         del diag_df
 
         logger.info(
-            "Index built | notes_indexed=%d | codes_indexed=%d",
-            len(self.notes_index),
+            "diagnoses.csv loaded | coded_notes=%d | time=%.3fs",
             len(self.gt_codes_index),
+            time.perf_counter() - t0,
         )
 
     # ------------------------------------------------------------------
@@ -110,36 +131,22 @@ class DatasetStore:
     def get_note(self, note_id: str) -> str | None:
         """Return the clinical note text for a given note_id.
 
-        Args:
-            note_id: The unique identifier of the note.
-
-        Returns:
-            The note text, or None if the note_id is not found.
+        Returns None if the note_id is not found.
         """
         return self.notes_index.get(note_id)
 
     def get_gt_codes(self, note_id: str) -> list[str]:
         """Return the ordered list of ICD-10 codes for a given note_id.
 
-        Args:
-            note_id: The unique identifier of the note.
-
-        Returns:
-            A list of ICD-10 code strings ordered by seq_num,
-            or an empty list if the note_id has no codes.
+        Returns an empty list if the note_id has no codes.
         """
         return self.gt_codes_index.get(note_id, [])
 
     def get_batch(self, offset: int, size: int) -> list[dict]:
         """Return a batch of records for training iteration.
 
-        Args:
-            offset: Starting index into the note_ids_list.
-            size: Number of records to return.
-
-        Returns:
-            A list of dicts, each with keys note_id, text, gt_codes.
-            Returns an empty list if offset >= total notes.
+        Each record contains note_id, text, and gt_codes.
+        Returns an empty list if offset >= total notes.
         """
         if offset >= len(self.note_ids_list):
             return []
@@ -155,29 +162,13 @@ class DatasetStore:
         ]
 
     def get_note_ids(self, offset: int, size: int) -> list[str]:
-        """Return a slice of all note IDs.
-
-        Args:
-            offset: Starting index into the note_ids_list.
-            size: Number of IDs to return.
-
-        Returns:
-            A list of note_id strings.
-        """
+        """Return a slice of all note IDs."""
         return self.note_ids_list[offset : offset + size]
 
     def get_total_notes(self) -> int:
-        """Return the total number of notes loaded.
-
-        Returns:
-            Count of entries in notes_index.
-        """
+        """Return the total number of unique notes loaded."""
         return len(self.notes_index)
 
     def get_total_coded_notes(self) -> int:
-        """Return the number of notes that have ground-truth codes.
-
-        Returns:
-            Count of unique note_ids in gt_codes_index.
-        """
+        """Return the number of notes that have ground-truth codes."""
         return len(self.gt_codes_index)

@@ -19,15 +19,15 @@ from dataset_svc.store import DatasetStore
 # ------------------------------------------------------------------
 
 NOTES_ROWS = [
-    {"note_id": "N001", "subject_id_x": "S1", "hadm_id": "H1", "text": "Fever and chills."},
-    {"note_id": "N002", "subject_id_x": "S2", "hadm_id": "H2", "text": "Routine visit."},
-    {"note_id": "N003", "subject_id_x": "S3", "hadm_id": "H3", "text": "Follow-up."},
+    {"note_id": "01-JAN-2024", "subject_id_x": "1001", "hadm_id": "2001", "text": "Fever and chills."},
+    {"note_id": "02-FEB-2024", "subject_id_x": "1002", "hadm_id": "2002", "text": "Routine visit."},
+    {"note_id": "03-MAR-2024", "subject_id_x": "1003", "hadm_id": "2003", "text": "Follow-up."},
 ]
 
 DIAGNOSES_ROWS = [
-    {"note_id": "N001", "seq_num": "1", "icd_code": "A01"},
-    {"note_id": "N001", "seq_num": "2", "icd_code": "B02"},
-    {"note_id": "N002", "seq_num": "1", "icd_code": "C03"},
+    {"note_id": "01-JAN-2024", "seq_num": "1", "icd_code": "A01"},
+    {"note_id": "01-JAN-2024", "seq_num": "2", "icd_code": "B02"},
+    {"note_id": "02-FEB-2024", "seq_num": "1", "icd_code": "C03"},
 ]
 
 
@@ -82,10 +82,10 @@ class TestNoteEndpoint:
     """GET /note/{note_id} → verify text returned."""
 
     def test_valid_note(self, client: TestClient) -> None:
-        resp = client.get("/note/N001")
+        resp = client.get("/note/01-JAN-2024")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["note_id"] == "N001"
+        assert body["note_id"] == "01-JAN-2024"
         assert body["text"] == "Fever and chills."
 
     def test_invalid_note(self, client: TestClient) -> None:
@@ -97,14 +97,14 @@ class TestGTCodesEndpoint:
     """GET /gt_codes/{note_id} → verify ordered list returned."""
 
     def test_valid_note(self, client: TestClient) -> None:
-        resp = client.get("/gt_codes/N001")
+        resp = client.get("/gt_codes/01-JAN-2024")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["note_id"] == "N001"
+        assert body["note_id"] == "01-JAN-2024"
         assert body["gt_codes"] == ["A01", "B02"]
 
     def test_note_without_codes(self, client: TestClient) -> None:
-        resp = client.get("/gt_codes/N003")
+        resp = client.get("/gt_codes/03-MAR-2024")
         assert resp.status_code == 404
 
 
