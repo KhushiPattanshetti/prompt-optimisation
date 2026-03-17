@@ -78,7 +78,7 @@ Not specified
 ## Repo structure
 
 ```json
-{
+
 prompt-optimisation/
 │
 ├── rewriter_sft_svc/
@@ -95,5 +95,5 @@ prompt-optimisation/
 ├── llm.txt
 ├── .gitignore
 └── README.md
-}
+
 ```
