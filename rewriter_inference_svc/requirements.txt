@@ -4,5 +4,4 @@ torch
 transformers
 pydantic
 pytest
-locust
 httpx
