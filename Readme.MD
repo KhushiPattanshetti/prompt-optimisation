@@ -38,6 +38,8 @@ The model accepts a clinical note in JSON format:
 }
 ```
 
+---
+
 ## Output Format
 
 ```json
@@ -75,6 +77,9 @@ Not specified
 
 ```
 
+---
+
+
 ## Repo structure
 
 ```json
@@ -97,3 +102,4 @@ prompt-optimisation/
 └── README.md
 
 ```
+---
