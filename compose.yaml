@@ -2,6 +2,7 @@ services:
   rewriter_sft_svc:
     build: ./rewriter_sft_svc
     container_name: rewriter_sft_svc
+    command: python -m uvicorn app:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     environment:

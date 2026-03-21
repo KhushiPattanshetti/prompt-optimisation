@@ -19,5 +19,16 @@ pyyaml>=6.0
 tqdm>=4.66.0
 rich>=13.7.0
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+torch
+transformers
+accelerate
+peft
+sentencepiece
+safetensors
+huggingface_hub
