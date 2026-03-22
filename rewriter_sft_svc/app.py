@@ -36,9 +36,7 @@ class RewriteResponse(BaseModel):
     structured_output: str
 
 
-# For maximum stability on Mac, force CPU.
-# Change later if you want CUDA/MPS support.
-device = "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = None
 model = None
