@@ -1,0 +1,47 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Environments
+.venv/
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and reports
+logs/*.log
+logs/*.csv
+logs/*.json
+logs/*.md
+logs/*.txt
+logs/external_tmp_migrated_20260326/
+
+# Model outputs & checkpoints
+rl_loop_repo/rl_loop_svc/rollouts/
+rl_loop_repo/rl_loop_svc/rl_checkpoints/
+rewriter_inference_repo/rewriter_inference_svc/inference_outputs/
+icd10_coding_repo/icd10_coding_svc/OUTPUT*/
+
+# Caches
+hf_cache/
+.tmp/
+tmp/
+**/tmp/
+rewriter_best_prompts_cache*.json
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Data downloads (keep tracked data/ if curated)
+dataset_svc_repo/data/*.parquet
+dataset_svc_repo/data/*.zip
