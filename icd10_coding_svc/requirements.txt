@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+torch
+transformers
+bitsandbytes
+accelerate
+pydantic
+pandas
+pytest
+requests
+httpx<0.28

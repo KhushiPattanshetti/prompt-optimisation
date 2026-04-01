@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test cache
+.pytest_cache/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.env
+venv/
+ENV/
+
+# Data
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.db
+*.sqlite
+*.parquet
+*.h5
+*.hdf5
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+
+# Local datasets
+config/*.csv
+dataset/*.csv
+dataset/user_instructions/*.csv
+
+# Output
+output/
+*.log
+*.tmp
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+llm.txt
+
+# Only share code, config, and test files
+!app/
+!config/
+!dataset/
+!test/
+!main.py
+!README.md
+!requirements.txt
+!wsgi.py
+!llm.json

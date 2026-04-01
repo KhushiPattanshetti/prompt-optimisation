@@ -1,0 +1,739 @@
+{
+  "made_by_team_for_agent": {
+    "system_role": {
+      "persona": "Senior Machine Learning Infrastructure Engineer",
+      "task": "Generate a production-grade Python microservice called icd10_coding_svc",
+      "description": "This microservice performs inference using a frozen LLM to convert both rewritten and original clinical prompts into ICD-10 codes, and fetches ground truth codes from the dataset.",
+      "key_constraint": "The service performs INFERENCE ONLY. Model weights must never be updated."
+    },
+
+    "project_context": {
+      "project_name": "prompt_optimisation",
+      "role": "Frozen evaluator in a PPO reinforcement learning pipeline for clinical note ICD-10 coding",
+      "pipeline_position": {
+        "upstream": "Prompt Rewriter Service",
+        "current": "icd10_coding_svc",
+        "downstream": "reward_metric_svc"
+      },
+      "inputs": [
+        "rewritten_prompt — from Prompt Rewriter Service",
+        "original_prompt — unmodified, passed through alongside",
+        "note_id — to fetch ground truth codes from dataset"
+      ],
+      "inference_passes": [
+        "1. Enhanced inference → enh_codes (from rewritten_prompt)",
+        "2. Original inference → org_codes (from original_prompt)"
+      ],
+      "fetches": "gt_codes from the ground truth dataset using note_id",
+      "forwards_to": "reward_metric_svc — receives enh_codes, org_codes, and gt_codes"
+    },
+
+    "directory_structure": {
+      "root": "prompt_optimisation/",
+      "runtime_directories": {
+        "gt_codes/": "Ground truth ICD-10 codes storage — one {note_id}.json per note"
+      },
+      "service_root": "icd10_coding_svc/",
+      "files": [
+        "app.py",
+        "config.py",
+        "model_loader.py",
+        "inference_engine.py",
+        "code_parser.py",
+        "gt_fetcher.py",
+        "schemas.py",
+        "logger.py",
+        "requirements.txt",
+        "README.md"
+      ],
+      "test_structure": {
+        "tests/unit/": [
+          "test_inference_engine.py",
+          "test_code_parser.py",
+          "test_gt_fetcher.py"
+        ],
+        "tests/integration/": [
+          "test_service_pipeline.py"
+        ],
+        "tests/e2e/": [
+          "test_end_to_end_inference.py"
+        ]
+      }
+    },
+
+    "model": {
+      "hub_id": "m42-health/Llama3-Med42-8B",
+      "task": "frozen inference only",
+      "loader": "AutoModelForCausalLM + AutoTokenizer",
+      "quantization": {
+        "reason": "Required for T4 16GB",
+        "config": "BitsAndBytesConfig",
+        "load_in_4bit": true,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_compute_dtype": "torch.bfloat16",
+        "bnb_4bit_use_double_quant": true
+      },
+      "post_load_steps": [
+        "for param in model.parameters(): param.requires_grad = False",
+        "model.eval()"
+      ],
+      "constraint": "The model must remain frozen and in eval mode for the entire lifetime of the service."
+    },
+
+    "checkpoint_loading_logic": {
+      "local_cache_path": "sft_checkpoints/med42/",
+      "if_cache_exists": "Load from local cache",
+      "if_no_cache": "Download from HuggingFace hub, then save to sft_checkpoints/med42/",
+      "forbidden": "Never load from rl_checkpoints/",
+      "note": "The frozen LLM checkpoint never changes."
+    },
+
+    "ground_truth_dataset": {
+      "tables": {
+        "notes": "{ note_id, subject_id_x, hadm_id, text }",
+        "diagnoses": "{ note_id, seq_num, icd_code }"
+      },
+      "join_key": "note_id — multiple diagnoses rows can share the same note_id, each representing one ICD-10 code",
+      "gt_fetcher_requirements": [
+        "1. Accept a note_id as input",
+        "2. Query diagnoses table for all rows matching note_id",
+        "3. Return the list of icd_code values as gt_codes"
+      ],
+      "loading": "notes.csv and diagnoses.csv are loaded once at service startup from paths defined in config.py",
+      "disk_persistence": {
+        "path": "gt_codes/{note_id}.json",
+        "format": { "note_id": "12345", "gt_codes": ["I21.9", "E11.9", "Z79.4"] },
+        "cache_first": "If gt_codes/{note_id}.json already exists on disk, load from disk without querying the dataset."
+      }
+    },
+
+    "input": {
+      "endpoint": "POST /generate_codes",
+      "request_example": {
+        "note_id": "12345",
+        "original_prompt": "Extract ICD-10 codes from: Patient has chest pain...",
+        "rewritten_prompt": "Step 1: Identify symptoms... Step 2: Map to ICD-10..."
+      },
+      "fields": {
+        "note_id": "Used to fetch gt_codes from dataset",
+        "original_prompt": "Unmodified prompt, passed directly to model",
+        "rewritten_prompt": "Enhanced prompt from Prompt Rewriter Service"
+      }
+    },
+
+    "inference_workflow": {
+      "pass_1": {
+        "name": "Enhanced inference",
+        "input": "rewritten_prompt",
+        "output": "enh_codes"
+      },
+      "pass_2": {
+        "name": "Original inference",
+        "input": "original_prompt",
+        "output": "org_codes"
+      },
+      "shared_config": "Both passes use identical generation config and the same frozen model instance",
+      "grad_context": "Both passes must run inside torch.no_grad()",
+      "gt_fetch": "FETCH gt_codes using gt_fetcher.get_gt_codes(note_id)",
+      "result": "All three (enh_codes, org_codes, gt_codes) are included in the response and forwarded to reward_metric_svc"
+    },
+
+    "generation_config": {
+      "max_new_tokens": 256,
+      "temperature": 0.1,
+      "do_sample": false,
+      "repetition_penalty": 1.1,
+      "prompt_template": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{SYSTEM_INSTRUCTION}\n<|eot_id|>\n<|start_header_id|>user<|end_header_id|>\n{prompt}\n<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>",
+      "system_instruction": "You are a clinical coding expert. Extract all ICD-10-CM codes from the given clinical note. Output codes as a JSON list only. Do not include explanations.",
+      "system_instruction_note": "The same system instruction is used for both inference passes. Defined in config.py."
+    },
+
+    "code_parsing": {
+      "module": "code_parser.py",
+      "icd10_regex": "[A-Z][0-9]{2}(\\.[A-Z0-9]{1,4})?",
+      "strategies": {
+        "strategy_1": "JSON extraction — parse JSON list directly from model output",
+        "strategy_2": "Regex extraction — apply regex pattern if JSON parsing fails",
+        "strategy_3": "Fallback — return empty list, set parsing_success = false, log warning"
+      },
+      "deduplication": "Always deduplicate codes before returning"
+    },
+
+    "output": {
+      "response_example": {
+        "note_id": "12345",
+        "enh_codes": ["R07.9", "I20.9"],
+        "org_codes": ["R07.9"],
+        "gt_codes": ["R07.9", "I20.9", "R06.0"],
+        "enh_raw_output": "...",
+        "org_raw_output": "...",
+        "parsing_success": true
+      },
+      "field_definitions": {
+        "enh_codes": "ICD-10 codes from rewritten_prompt inference",
+        "org_codes": "ICD-10 codes from original_prompt inference",
+        "gt_codes": "Ground truth codes fetched via note_id",
+        "enh_raw_output": "Raw model text for enhanced pass (for debugging)",
+        "org_raw_output": "Raw model text for original pass (for debugging)",
+        "parsing_success": "false if either parsing pass returns empty list"
+      }
+    },
+
+    "downstream_forwarding": {
+      "endpoint": "POST {REWARD_SERVICE_URL}/compute_reward",
+      "payload_example": {
+        "note_id": "12345",
+        "gt_codes": ["R07.9", "I20.9", "R06.0"],
+        "enh_codes": ["R07.9", "I20.9"],
+        "org_codes": ["R07.9"]
+      },
+      "async": "Forwarding must happen asynchronously after the API response is returned — must not block response latency",
+      "on_failure": "Log the error and retry once. Do not raise an exception to the caller."
+    },
+
+    "output_storage": {
+      "path": "inference_outputs/icd10/{note_id}_{timestamp}.json",
+      "schema": {
+        "timestamp": "2026-03-11T20:11:12",
+        "note_id": "12345",
+        "rewritten_prompt": "...",
+        "original_prompt": "...",
+        "enh_codes": ["..."],
+        "org_codes": ["..."],
+        "gt_codes": ["..."],
+        "parsing_success": true
+      }
+    },
+
+    "module_responsibilities": {
+      "config_py": {
+        "MODEL_NAME": "m42-health/Llama3-Med42-8B",
+        "LOCAL_CACHE_PATH": "sft_checkpoints/med42/",
+        "OUTPUT_PATH": "inference_outputs/icd10/",
+        "GT_CODES_PATH": "gt_codes/",
+        "NOTES_CSV_PATH": "data/notes.csv",
+        "DIAGNOSES_CSV_PATH": "data/diagnoses.csv",
+        "REWARD_SERVICE_URL": "http://localhost:8002",
+        "MAX_NEW_TOKENS": 256,
+        "TEMPERATURE": 0.1,
+        "DO_SAMPLE": false,
+        "REPETITION_PENALTY": 1.1,
+        "SYSTEM_INSTRUCTION": "...",
+        "ICD10_REGEX_PATTERN": "[A-Z][0-9]{2}(\\.[A-Z0-9]{1,4})?"
+      },
+      "model_loader_py": {
+        "function": "load_model() → (model, tokenizer)",
+        "responsibilities": [
+          "Cache check",
+          "HuggingFace download",
+          "Weight freezing",
+          "eval mode",
+          "Model instance caching"
+        ]
+      },
+      "inference_engine_py": {
+        "function": "run_inference(note_id, original_prompt, rewritten_prompt) → dict",
+        "responsibilities": [
+          "Run both inference passes",
+          "Fetch gt_codes",
+          "Save output",
+          "Forward to reward_metric_svc asynchronously",
+          "Serialize GPU calls with threading.Lock()"
+        ],
+        "lock": "_inference_lock = threading.Lock()"
+      },
+      "gt_fetcher_py": {
+        "function": "get_gt_codes(note_id: str) → list[str]",
+        "responsibilities": [
+          "Check gt_codes/{note_id}.json first",
+          "Fall back to querying diagnoses.csv",
+          "Persist result to gt_codes/{note_id}.json"
+        ]
+      },
+      "code_parser_py": {
+        "functions": [
+          "parse_icd10_codes(raw_output: str) → list[str] — JSON → regex → fallback strategy",
+          "validate_code(code: str) → bool"
+        ]
+      },
+      "schemas_py": {
+        "CodeRequest": "{ note_id: str, original_prompt: str, rewritten_prompt: str }",
+        "CodeResponse": "{ note_id: str, enh_codes: list[str], org_codes: list[str], gt_codes: list[str], enh_raw_output: str, org_raw_output: str, parsing_success: bool }"
+      },
+      "logger_py": {
+        "log_events": [
+          "Model loaded",
+          "Request received (note_id)",
+          "Enhanced inference time",
+          "Original inference time",
+          "gt_codes fetched (source: disk or dataset)",
+          "Codes parsed (count + strategy used)",
+          "Forwarding to reward service (success or failure)",
+          "Output saved"
+        ]
+      },
+      "app_py": {
+        "POST /generate_codes": "validate → infer → respond → forward",
+        "GET /health": "returns model name + weights_frozen: true"
+      }
+    },
+
+    "concurrency": {
+      "mechanism": "threading.Lock() in inference_engine.py",
+      "reason": "Prevent CUDA OOM errors from concurrent GPU calls",
+      "scope": "Each request triggers two sequential inference passes within a single lock acquisition to ensure atomicity"
+    },
+
+    "run_command": "uvicorn app:app --host 0.0.0.0 --port 8001",
+
+    "port_allocation": {
+      "this_service": 8001,
+      "prompt_rewriter_service": 8000,
+      "reward_metric_service": 8002
+    },
+
+    "requirements_txt": [
+      "fastapi",
+      "uvicorn",
+      "torch",
+      "transformers",
+      "bitsandbytes",
+      "accelerate",
+      "pydantic",
+      "pandas",
+      "pytest",
+      "requests",
+      "httpx"
+    ]
+  },
+
+  "made_by_agent_for_agent": {
+    "service_overview": {
+      "name": "icd10_coding_svc",
+      "purpose": "Frozen LLM inference microservice that converts clinical prompts into ICD-10 codes and fetches ground truth codes. Acts as the evaluator in a PPO RL pipeline for clinical note coding.",
+      "language": "Python 3.10+",
+      "framework": "FastAPI",
+      "port": 8001,
+      "pipeline_position": {
+        "upstream": "Prompt Rewriter Service (port 8000)",
+        "downstream": "reward_metric_svc (port 8002)"
+      },
+      "key_constraint": "Inference ONLY — model weights must never be updated. Model always stays frozen and in eval() mode."
+    },
+
+    "directory_structure": {
+      "root": "icd10_coding_svc/",
+      "files": [
+        "app.py",
+        "config.py",
+        "model_loader.py",
+        "inference_engine.py",
+        "code_parser.py",
+        "gt_fetcher.py",
+        "schemas.py",
+        "logger.py",
+        "requirements.txt",
+        "README.md"
+      ],
+      "test_structure": {
+        "tests/unit/": [
+          "test_inference_engine.py",
+          "test_code_parser.py",
+          "test_gt_fetcher.py"
+        ],
+        "tests/integration/": [
+          "test_service_pipeline.py"
+        ],
+        "tests/e2e/": [
+          "test_end_to_end_inference.py"
+        ]
+      },
+      "runtime_directories": {
+        "gt_codes/": "Persisted ground truth JSON files, one per note_id. Located at project root (../gt_codes/).",
+        "inference_outputs/icd10/": "Persisted inference result JSON files per request.",
+        "sft_checkpoints/med42/": "Local model cache. Load from here if present; otherwise download from HuggingFace and save here.",
+        "data/": "Contains notes.csv and diagnoses.csv loaded at startup."
+      }
+    },
+
+    "model": {
+      "hub_id": "m42-health/Llama3-Med42-8B",
+      "loader": "AutoModelForCausalLM + AutoTokenizer from transformers",
+      "quantization": {
+        "library": "bitsandbytes",
+        "config": "BitsAndBytesConfig",
+        "load_in_4bit": true,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_compute_dtype": "torch.bfloat16",
+        "bnb_4bit_use_double_quant": true,
+        "reason": "Required to fit model on T4 16GB GPU"
+      },
+      "post_load_steps": [
+        "for param in model.parameters(): param.requires_grad = False",
+        "model.eval()"
+      ],
+      "checkpoint_logic": {
+        "local_cache_path": "sft_checkpoints/med42/",
+        "if_cache_exists": "Load from local cache using AutoModelForCausalLM.from_pretrained(LOCAL_CACHE_PATH)",
+        "if_no_cache": "Download from HuggingFace using hub_id, then save_pretrained to LOCAL_CACHE_PATH",
+        "forbidden": "Never load from rl_checkpoints/"
+      },
+      "caching": "model_loader.py must cache the loaded (model, tokenizer) instance in memory so it is only loaded once at service startup."
+    },
+
+    "config_py": {
+      "constants": {
+        "MODEL_NAME": "m42-health/Llama3-Med42-8B",
+        "LOCAL_CACHE_PATH": "sft_checkpoints/med42/",
+        "OUTPUT_PATH": "inference_outputs/icd10/",
+        "GT_CODES_PATH": "gt_codes/",
+        "NOTES_CSV_PATH": "data/notes.csv",
+        "DIAGNOSES_CSV_PATH": "data/diagnoses.csv",
+        "REWARD_SERVICE_URL": "http://localhost:8002",
+        "MAX_NEW_TOKENS": 256,
+        "TEMPERATURE": 0.1,
+        "DO_SAMPLE": false,
+        "REPETITION_PENALTY": 1.1,
+        "SYSTEM_INSTRUCTION": "You are a clinical coding expert. Extract all ICD-10-CM codes from the given clinical note. Output codes as a JSON list only. Do not include explanations.",
+        "ICD10_REGEX_PATTERN": "[A-Z][0-9]{2}(\\.[A-Z0-9]{1,4})?"
+      }
+    },
+
+    "schemas_py": {
+      "CodeRequest": {
+        "note_id": "str — identifies the clinical note; used to fetch gt_codes",
+        "original_prompt": "str — unmodified clinical prompt passed directly to model",
+        "rewritten_prompt": "str — enhanced prompt produced by Prompt Rewriter Service"
+      },
+      "CodeResponse": {
+        "note_id": "str",
+        "enh_codes": "list[str] — ICD-10 codes extracted from rewritten_prompt inference",
+        "org_codes": "list[str] — ICD-10 codes extracted from original_prompt inference",
+        "gt_codes": "list[str] — ground truth codes fetched via note_id",
+        "enh_raw_output": "str — raw model text for enhanced pass (debug)",
+        "org_raw_output": "str — raw model text for original pass (debug)",
+        "parsing_success": "bool — false if either pass returns an empty code list"
+      },
+      "implementation_note": "Use Pydantic BaseModel for both. Import in app.py and inference_engine.py."
+    },
+
+    "inference_engine_py": {
+      "public_function": "run_inference(note_id: str, original_prompt: str, rewritten_prompt: str) -> dict",
+      "steps": [
+        "1. Acquire _inference_lock (threading.Lock) to serialize GPU access",
+        "2. Load (model, tokenizer) from model_loader.load_model()",
+        "3. Build Llama-3 chat-formatted prompt string for rewritten_prompt",
+        "4. Tokenize and run model.generate() inside torch.no_grad() → enh_raw_output",
+        "5. Build Llama-3 chat-formatted prompt string for original_prompt",
+        "6. Tokenize and run model.generate() inside torch.no_grad() → org_raw_output",
+        "7. Release _inference_lock",
+        "8. Call code_parser.parse_icd10_codes(enh_raw_output) → enh_codes",
+        "9. Call code_parser.parse_icd10_codes(org_raw_output) → org_codes",
+        "10. Call gt_fetcher.get_gt_codes(note_id) → gt_codes",
+        "11. Set parsing_success = len(enh_codes) > 0 and len(org_codes) > 0",
+        "12. Save result JSON to OUTPUT_PATH/{note_id}_{timestamp}.json",
+        "13. Schedule async forwarding to reward_metric_svc (BackgroundTasks or threading.Thread)",
+        "14. Return response dict"
+      ],
+      "concurrency": {
+        "lock": "_inference_lock = threading.Lock() — module-level singleton",
+        "scope": "Both inference passes (enh and org) run within a single lock acquisition",
+        "reason": "Prevents CUDA OOM from concurrent GPU calls"
+      },
+      "generation_config": {
+        "max_new_tokens": 256,
+        "temperature": 0.1,
+        "do_sample": false,
+        "repetition_penalty": 1.1
+      },
+      "prompt_template": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{SYSTEM_INSTRUCTION}\n<|eot_id|>\n<|start_header_id|>user<|end_header_id|>\n{prompt}\n<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>",
+      "output_storage_schema": {
+        "timestamp": "ISO 8601 string e.g. 2026-03-11T20:11:12",
+        "note_id": "str",
+        "rewritten_prompt": "str",
+        "original_prompt": "str",
+        "enh_codes": "list[str]",
+        "org_codes": "list[str]",
+        "gt_codes": "list[str]",
+        "parsing_success": "bool"
+      }
+    },
+
+    "gt_fetcher_py": {
+      "public_function": "get_gt_codes(note_id: str) -> list[str]",
+      "logic": [
+        "1. Check if GT_CODES_PATH/{note_id}.json exists on disk",
+        "2. If YES: load and return gt_codes list from JSON file (skip CSV query)",
+        "3. If NO: filter diagnoses DataFrame (loaded at startup) for rows where note_id matches",
+        "4. Collect all icd_code values from matching rows into a list",
+        "5. Write {note_id: note_id, gt_codes: [...]} to GT_CODES_PATH/{note_id}.json",
+        "6. Return the list"
+      ],
+      "dataset": {
+        "notes_csv": "data/notes.csv — columns: note_id, subject_id_x, hadm_id, text",
+        "diagnoses_csv": "data/diagnoses.csv — columns: note_id, seq_num, icd_code",
+        "loading": "Both CSVs are loaded once at service startup via pandas.read_csv(). Store as module-level DataFrames.",
+        "join_key": "note_id (string — treat as str to avoid type mismatch)"
+      },
+      "disk_format": {
+        "path": "gt_codes/{note_id}.json",
+        "content": "{\"note_id\": \"12345\", \"gt_codes\": [\"I21.9\", \"E11.9\", \"Z79.4\"]}"
+      }
+    },
+
+    "code_parser_py": {
+      "public_functions": {
+        "parse_icd10_codes": {
+          "signature": "parse_icd10_codes(raw_output: str) -> list[str]",
+          "strategy_1_json": "Attempt json.loads() on the raw output or the first JSON array found via regex r'\\[.*?\\]' with re.DOTALL. If successful and result is a list, validate each element with validate_code().",
+          "strategy_2_regex": "If JSON fails, apply re.findall(ICD10_REGEX_PATTERN, raw_output) to extract all matching code strings.",
+          "strategy_3_fallback": "If regex also returns empty list, log a warning, set parsing_success indicator to false, return [].",
+          "deduplication": "Always return list(dict.fromkeys(codes)) to preserve order while deduplicating."
+        },
+        "validate_code": {
+          "signature": "validate_code(code: str) -> bool",
+          "rule": "Return True if re.fullmatch(ICD10_REGEX_PATTERN, code) is not None, else False."
+        }
+      },
+      "icd10_regex": "[A-Z][0-9]{2}(\\.[A-Z0-9]{1,4})?"
+    },
+
+    "logger_py": {
+      "library": "Python standard logging module",
+      "log_events": [
+        "Model loaded — include model name and source (cache or HuggingFace)",
+        "Request received — include note_id",
+        "Enhanced inference completed — include elapsed time in seconds",
+        "Original inference completed — include elapsed time in seconds",
+        "gt_codes fetched — include note_id and source (disk or dataset) and count",
+        "Codes parsed — include strategy used (json/regex/fallback) and count for each pass",
+        "Forwarding to reward_metric_svc — include success/failure and note_id",
+        "Output saved — include file path"
+      ],
+      "format": "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    },
+
+    "app_py": {
+      "framework": "FastAPI",
+      "startup_event": "Load model (model_loader.load_model()), load notes.csv and diagnoses.csv DataFrames into gt_fetcher module, create output directories if not present.",
+      "endpoints": {
+        "POST /generate_codes": {
+          "request_body": "CodeRequest",
+          "response_model": "CodeResponse",
+          "logic": [
+            "1. Validate request via Pydantic (automatic with FastAPI)",
+            "2. Call inference_engine.run_inference(note_id, original_prompt, rewritten_prompt)",
+            "3. Return CodeResponse",
+            "4. After response is returned, fire async background task to POST to reward_metric_svc"
+          ]
+        },
+        "GET /health": {
+          "response": "{\"status\": \"ok\", \"model\": \"m42-health/Llama3-Med42-8B\", \"weights_frozen\": true}"
+        }
+      },
+      "downstream_forwarding": {
+        "endpoint": "POST {REWARD_SERVICE_URL}/compute_reward",
+        "payload_fields": ["note_id", "gt_codes", "enh_codes", "org_codes"],
+        "async": "Use FastAPI BackgroundTasks or a daemon threading.Thread after response is sent",
+        "retry": "On failure, retry once. If second attempt also fails, log error only — do not raise exception to caller.",
+        "library": "httpx (preferred for async) or requests"
+      }
+    },
+
+    "requirements_txt": [
+      "fastapi",
+      "uvicorn",
+      "torch",
+      "transformers",
+      "bitsandbytes",
+      "accelerate",
+      "pydantic",
+      "pandas",
+      "pytest",
+      "requests",
+      "httpx"
+    ],
+
+    "run_command": "uvicorn app:app --host 0.0.0.0 --port 8001",
+
+    "testing": {
+      "framework": "pytest",
+      "overview": "Tests are split into three tiers: unit (mock model/GPU), integration (real module wiring, mock HTTP), e2e (full service running).",
+
+      "unit_tests": {
+        "test_code_parser.py": {
+          "file": "tests/unit/test_code_parser.py",
+          "cases": [
+            {
+              "name": "test_parse_json_success",
+              "description": "Raw output is a valid JSON list of ICD-10 codes. Expect parse_icd10_codes to return the correct deduplicated list using strategy 1.",
+              "input": "'[\"R07.9\", \"I20.9\", \"R07.9\"]'",
+              "expected": "['R07.9', 'I20.9']"
+            },
+            {
+              "name": "test_parse_regex_fallback",
+              "description": "Raw output is prose containing ICD-10 codes but not valid JSON. Expect strategy 2 regex extraction to succeed.",
+              "input": "'The patient has R07.9 and also I20.9.'",
+              "expected": "['R07.9', 'I20.9']"
+            },
+            {
+              "name": "test_parse_empty_fallback",
+              "description": "Raw output contains no ICD-10 codes. Expect strategy 3 fallback to return empty list.",
+              "input": "'No codes found in this output.'",
+              "expected": "[]"
+            },
+            {
+              "name": "test_validate_code_valid",
+              "description": "Pass a well-formed ICD-10 code. validate_code should return True.",
+              "input": "'I21.9'",
+              "expected": "True"
+            },
+            {
+              "name": "test_validate_code_invalid",
+              "description": "Pass a malformed string. validate_code should return False.",
+              "input": "'not-a-code'",
+              "expected": "False"
+            },
+            {
+              "name": "test_parse_deduplication",
+              "description": "JSON list contains duplicate codes. Expect output list to have each code only once, order preserved.",
+              "input": "'[\"E11.9\", \"Z79.4\", \"E11.9\"]'",
+              "expected": "['E11.9', 'Z79.4']"
+            }
+          ]
+        },
+
+        "test_gt_fetcher.py": {
+          "file": "tests/unit/test_gt_fetcher.py",
+          "setup": "Use tmp_path pytest fixture to create temporary gt_codes/ dir and sample diagnoses CSV. Monkey-patch gt_fetcher module-level DataFrames.",
+          "cases": [
+            {
+              "name": "test_get_gt_codes_from_disk",
+              "description": "A {note_id}.json already exists in gt_codes/. Expect get_gt_codes to return the list from disk without reading the DataFrame.",
+              "mock": "Pre-create gt_codes/12345.json with known codes. Patch diagnoses_df so test would fail if it's accessed.",
+              "expected": "Returns codes from disk file."
+            },
+            {
+              "name": "test_get_gt_codes_from_dataset",
+              "description": "No cached file exists. DataFrame has matching rows for the note_id. Expect codes to be returned and a new JSON file written to disk.",
+              "mock": "Use a small pandas DataFrame with 3 rows for note_id=12345.",
+              "expected": "Returns correct list; gt_codes/12345.json is created with correct content."
+            },
+            {
+              "name": "test_get_gt_codes_unknown_note",
+              "description": "No disk file and no matching rows in DataFrame. Expect empty list and an empty gt_codes file written.",
+              "expected": "[]"
+            }
+          ]
+        },
+
+        "test_inference_engine.py": {
+          "file": "tests/unit/test_inference_engine.py",
+          "setup": "Mock model_loader.load_model() to return (mock_model, mock_tokenizer). Mock torch.no_grad(). Mock gt_fetcher.get_gt_codes(). Mock file I/O. Do NOT require a GPU.",
+          "cases": [
+            {
+              "name": "test_run_inference_returns_correct_keys",
+              "description": "Call run_inference with valid inputs using mocked model. Expect result dict to contain all required keys: note_id, enh_codes, org_codes, gt_codes, enh_raw_output, org_raw_output, parsing_success.",
+              "mock": "model.generate() returns mock token tensor. tokenizer.decode() returns a JSON string of codes."
+            },
+            {
+              "name": "test_run_inference_parsing_success_true",
+              "description": "mock model output returns valid ICD-10 JSON for both passes. Expect parsing_success = True.",
+              "expected": "parsing_success == True"
+            },
+            {
+              "name": "test_run_inference_parsing_success_false",
+              "description": "Mock model output returns empty string for one pass. Expect parsing_success = False.",
+              "expected": "parsing_success == False"
+            },
+            {
+              "name": "test_output_file_written",
+              "description": "After run_inference, verify that a JSON file is created in OUTPUT_PATH with the correct fields.",
+              "mock": "Patch open() or use tmp_path."
+            },
+            {
+              "name": "test_inference_lock_acquired",
+              "description": "Patch threading.Lock and verify it is acquired and released exactly once per call to run_inference.",
+              "mock": "Use unittest.mock.patch on threading.Lock"
+            }
+          ]
+        }
+      },
+
+      "integration_tests": {
+        "test_service_pipeline.py": {
+          "file": "tests/integration/test_service_pipeline.py",
+          "setup": "Use FastAPI TestClient. Mock model_loader.load_model() and gt_fetcher calls. Mock httpx POST to reward_metric_svc.",
+          "cases": [
+            {
+              "name": "test_post_generate_codes_valid_request",
+              "description": "POST valid CodeRequest to /generate_codes. Expect 200 and a response body conforming to CodeResponse schema with all required fields.",
+              "mock": "inference_engine.run_inference patched to return a known result dict."
+            },
+            {
+              "name": "test_post_generate_codes_missing_field",
+              "description": "POST request body missing rewritten_prompt. Expect 422 Unprocessable Entity from Pydantic validation.",
+              "expected": "HTTP 422"
+            },
+            {
+              "name": "test_get_health",
+              "description": "GET /health. Expect 200 and JSON with weights_frozen: true and model name.",
+              "expected": "{\"status\": \"ok\", \"model\": \"m42-health/Llama3-Med42-8B\", \"weights_frozen\": true}"
+            },
+            {
+              "name": "test_forwarding_called_after_response",
+              "description": "After POST /generate_codes, verify that the background task fires a POST to REWARD_SERVICE_URL/compute_reward with the correct payload fields.",
+              "mock": "Patch httpx.AsyncClient.post or requests.post. Inspect call args."
+            },
+            {
+              "name": "test_forwarding_failure_does_not_propagate",
+              "description": "Mock httpx to raise an exception on the first call and succeed on the retry. Verify the /generate_codes response is still 200 and no exception is raised.",
+              "expected": "HTTP 200 with valid CodeResponse body"
+            }
+          ]
+        }
+      },
+
+      "e2e_tests": {
+        "test_end_to_end_inference.py": {
+          "file": "tests/e2e/test_end_to_end_inference.py",
+          "prerequisite": "Requires the service to be running locally on port 8001 with a real or stubbed model. Skip if GPU not available using pytest.mark.skipif.",
+          "cases": [
+            {
+              "name": "test_full_inference_cycle",
+              "description": "Send a real POST request to http://localhost:8001/generate_codes with a sample clinical note_id. Verify the response has non-empty enh_codes or org_codes and parsing_success is either True or False (no crash).",
+              "note": "Use a real note_id that exists in data/diagnoses.csv."
+            },
+            {
+              "name": "test_gt_codes_persisted_to_disk",
+              "description": "After the above call, verify that gt_codes/{note_id}.json exists on disk and contains a gt_codes list.",
+              "expected": "File exists; gt_codes is a list."
+            },
+            {
+              "name": "test_inference_output_persisted_to_disk",
+              "description": "After a successful call, verify that at least one file exists in inference_outputs/icd10/ matching the pattern {note_id}_*.json with the correct schema fields.",
+              "expected": "File exists; contains timestamp, enh_codes, org_codes, gt_codes."
+            },
+            {
+              "name": "test_health_endpoint_live",
+              "description": "GET http://localhost:8001/health. Expect 200 and weights_frozen: true.",
+              "expected": "HTTP 200"
+            }
+          ]
+        }
+      },
+
+      "pytest_configuration": {
+        "run_unit_only": "pytest tests/unit/",
+        "run_integration_only": "pytest tests/integration/",
+        "run_all": "pytest tests/",
+        "skip_gpu_marker": "Use @pytest.mark.skipif(not torch.cuda.is_available(), reason='GPU required') on e2e tests and any test that cannot be fully mocked.",
+        "recommended_fixtures": [
+          "tmp_path — for temporary file I/O in gt_fetcher and output storage tests",
+          "monkeypatch — for replacing module-level globals (DataFrames, model instances)",
+          "unittest.mock.patch — for mocking model.generate(), httpx calls, threading.Lock"
+        ]
+      }
+    }
+  }
+}
