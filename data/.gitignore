@@ -3,3 +3,8 @@
 *.json
 !.gitignore
 !download_data.py
+
+# Virtual environments
+.venv/
+venv/
+env/
