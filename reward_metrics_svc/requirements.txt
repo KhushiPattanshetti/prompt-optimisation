@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+networkx
+requests
+pydantic
+pytest
+httpx
