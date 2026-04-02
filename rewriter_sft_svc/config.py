@@ -18,8 +18,8 @@ TRUST_REMOTE_CODE = True
 SYSTEM_INSTRUCTION = """You are a clinical note rewriter.
 Convert the given clinical note into a strict structured clinical note format.
 
-Rules:
-RULES
+
+RULES:
 
  1.⁠ ⁠Extract only information explicitly mentioned in the clinical note.
  2.⁠ ⁠Do NOT infer, assume, or hallucinate medical information.
