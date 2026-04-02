@@ -1,5 +1,8 @@
 import os
-import traceback
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -14,7 +17,19 @@ from config import (
     DO_SAMPLE,
 )
 
-app = FastAPI(title="rewriter_sft_svc")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rewriter_sft_svc")
+
+tokenizer = None
+model = None
+device = None
+
+HF_ADAPTER_REPO = os.environ.get("HF_ADAPTER_REPO", "").strip()
+LOCAL_ADAPTER_PATH = os.environ.get("LOCAL_ADAPTER_PATH", "").strip()
+TRUST_REMOTE_CODE = os.environ.get("TRUST_REMOTE_CODE", "true").lower() == "true"
+
+USE_4BIT = os.environ.get("USE_4BIT", "false").lower() == "true"
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "12000"))
 
 
 class RewriteRequest(BaseModel):
@@ -28,105 +43,167 @@ class RewriteResponse(BaseModel):
     instruction_id: str
     filename: str
     structured_output: str
+    device: str
 
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ADAPTER_PATH = os.path.join(CURRENT_DIR, "lora_adapter")
-
-# For maximum stability on Mac, force CPU.
-# If you want, you can later switch back to MPS.
-device = "cpu"
-
-tokenizer = None
-model = None
-model_loaded = False
-load_error = None
+def clean_text(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) > MAX_INPUT_CHARS:
+        logger.warning("Input too long, truncating to %d chars", MAX_INPUT_CHARS)
+        text = text[:MAX_INPUT_CHARS]
+    return text
 
 
 def build_prompt(clinical_note: str) -> str:
-    return f"""<|system|>
-{SYSTEM_INSTRUCTION}
-<|user|>
-Convert the following clinical note into the required structured clinical note format:
-
-{clinical_note}
-<|assistant|>
-"""
-
-
-try:
-    print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        BASE_MODEL_NAME,
-        trust_remote_code=True
+    return (
+        f"{SYSTEM_INSTRUCTION.strip()}\n\n"
+        f"Clinical Note:\n{clinical_note.strip()}\n\n"
+        f"Structured Clinical Note:\n"
     )
 
-    if tokenizer.eos_token is None:
-        tokenizer.eos_token = "<|endoftext|>"
 
+def postprocess_output(text: str) -> str:
+    text = (text or "").strip()
+
+    if "Structured Clinical Note:" in text:
+        text = text.split("Structured Clinical Note:", 1)[-1].strip()
+
+    return text if text else "Not specified"
+
+
+def get_adapter_source() -> Optional[str]:
+    if LOCAL_ADAPTER_PATH:
+        return LOCAL_ADAPTER_PATH
+    if HF_ADAPTER_REPO:
+        return HF_ADAPTER_REPO
+    return None
+
+
+def load_model_and_tokenizer():
+    global tokenizer, model, device
+
+    logger.info("Initializing tokenizer and model...")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Detected device: %s", device)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL_NAME,
+        trust_remote_code=TRUST_REMOTE_CODE,
+    )
+
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer.padding_side = "left"
+    model_kwargs = {
+        "trust_remote_code": TRUST_REMOTE_CODE,
+        "low_cpu_mem_usage": True,
+    }
 
-    print(f"Using device: {device}")
-    print("Loading base model...")
+    if device == "cuda":
+        logger.info("GPU Name: %s", torch.cuda.get_device_name(0))
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    base_model = AutoModelForCausalLM.from_pretrained(
+        if USE_4BIT:
+            logger.info("Loading model in 4-bit mode")
+            model_kwargs["device_map"] = "auto"
+            model_kwargs["load_in_4bit"] = True
+        else:
+            logger.info("Loading model in float16 with auto device map")
+            model_kwargs["torch_dtype"] = torch.float16
+            model_kwargs["device_map"] = "auto"
+    else:
+        logger.info("Loading model on CPU")
+        model_kwargs["torch_dtype"] = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_NAME,
-        trust_remote_code=True,
-        torch_dtype=torch.float32
-    ).to(device)
+        **model_kwargs,
+    )
 
-    print("Loading LoRA adapter...")
-    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
-    model = model.to(device)
+    adapter_source = get_adapter_source()
+    if adapter_source:
+        logger.info("Loading adapter from: %s", adapter_source)
+        model = PeftModel.from_pretrained(model, adapter_source)
+
     model.eval()
+    logger.info("Model loaded successfully")
 
-    model_loaded = True
-    print("Model loaded successfully.")
 
-except Exception as e:
-    load_error = str(e)
-    model_loaded = False
-    print(f"Model loading failed: {e}")
-    traceback.print_exc()
+def warmup_model():
+    global tokenizer, model, device
+
+    try:
+        logger.info("Running warmup...")
+        prompt = build_prompt(
+            "54-year-old male with fever, cough, and shortness of breath for three days."
+        )
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+        )
+
+        if device == "cuda":
+            first_device = next(model.parameters()).device
+            inputs = {k: v.to(first_device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            _ = model.generate(
+                **inputs,
+                max_new_tokens=32,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+
+        logger.info("Warmup done")
+    except Exception as e:
+        logger.warning("Warmup failed: %s", e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_model_and_tokenizer()
+    warmup_model()
+    yield
+
+
+app = FastAPI(
+    title="rewriter_sft_svc",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
 def root():
     return {
-        "service": "rewriter_sft_svc",
-        "status": "running",
-        "model_loaded": model_loaded,
+        "status": "ok",
         "device": device,
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "service": "rewriter_sft_svc",
-        "status": "ok" if model_loaded else "error",
-        "model_loaded": model_loaded,
-        "device": device,
-        "load_error": load_error,
+        "base_model": BASE_MODEL_NAME,
+        "adapter_loaded": bool(get_adapter_source()),
+        "use_4bit": USE_4BIT,
     }
 
 
 @app.post("/rewrite", response_model=RewriteResponse)
-def rewrite(req: RewriteRequest):
-    if not model_loaded or model is None or tokenizer is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model is not loaded. Error: {load_error}"
-        )
+def rewrite_note(payload: RewriteRequest):
+    global tokenizer, model, device
 
-    note = req.clinical_note.strip()
-    if not note:
+    if tokenizer is None or model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+
+    clinical_note = clean_text(payload.clinical_note)
+    if not clinical_note:
         raise HTTPException(status_code=400, detail="clinical_note is empty")
 
-    prompt = build_prompt(note)
+    prompt = build_prompt(clinical_note)
 
     try:
         inputs = tokenizer(
@@ -134,39 +211,44 @@ def rewrite(req: RewriteRequest):
             return_tensors="pt",
             truncation=True,
             max_length=2048,
-            padding=False
         )
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        if device == "cuda":
+            first_device = next(model.parameters()).device
+            inputs = {k: v.to(first_device) for k, v in inputs.items()}
 
-        eos_token_id = tokenizer.eos_token_id
-        pad_token_id = tokenizer.pad_token_id or eos_token_id
-
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask"),
+                **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=DO_SAMPLE,
-                eos_token_id=int(eos_token_id),
-                pad_token_id=int(pad_token_id),
+                temperature=TEMPERATURE if DO_SAMPLE else None,
+                top_p=0.95 if DO_SAMPLE else None,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+                repetition_penalty=1.05,
             )
 
-        prompt_len = inputs["input_ids"].shape[1]
-        generated_ids = outputs[0][prompt_len:]
-
-        structured_output = tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True
-        ).strip()
+        generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+        decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        structured_output = postprocess_output(decoded)
 
         return RewriteResponse(
-            status="OK",
-            instruction_id=req.instruction_id,
-            filename=req.filename,
+            status="success",
+            instruction_id=payload.instruction_id,
+            filename=payload.filename,
             structured_output=structured_output,
+            device=device,
         )
 
+    except torch.cuda.OutOfMemoryError:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=500,
+            detail="GPU out of memory during inference. Reduce input size or use 4-bit loading.",
+        )
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("Inference failed")
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
