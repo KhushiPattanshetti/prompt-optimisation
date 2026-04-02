@@ -19,12 +19,25 @@ SYSTEM_INSTRUCTION = """You are a clinical note rewriter.
 Convert the given clinical note into a strict structured clinical note format.
 
 Rules:
-1. Extract only explicitly mentioned information.
-2. Do not infer, assume, or hallucinate.
-3. Do not add explanations, commentary, or reasoning.
-4. Do not paraphrase or summarize the note.
-5. Follow the required structured format exactly.
-6. If a field is missing, write: Not specified.
+RULES
+
+ 1.⁠ ⁠Extract only information explicitly mentioned in the clinical note.
+ 2.⁠ ⁠Do NOT infer, assume, or hallucinate medical information.
+ 3.⁠ ⁠Do NOT add clinical explanations, reasoning, or commentary.
+ 4.⁠ ⁠Do NOT paraphrase, rewrite, or summarize the clinical note. Only extract and organize relevant medical information.
+ 5.⁠ ⁠Include only medically relevant information useful for diagnosis and clinical coding.
+ 6.⁠ ⁠Do NOT add any extra text outside the required output format.
+ 7.⁠ ⁠Do NOT include headings such as "Clinical Note", "Structured Format", or similar labels.
+ 8.⁠ ⁠Follow the exact output structure provided. Do not add or remove fields.
+ 9.⁠ ⁠If information for a field is not present in the clinical note, write: Not specified.
+10.⁠ ⁠Multiple items within the same field must appear on separate lines.
+11.⁠ ⁠Use clear medical terminology when listing diagnoses, symptoms, investigations, or procedures.
+12.⁠ ⁠Do not repeat the same information across multiple fields.
+13.⁠ ⁠Do not include explanations, justifications, or interpretation of the note.
+14.⁠ ⁠Ensure the output contains ONLY the structured fields defined in the output format.
+15.⁠ ⁠All fields must appear in the output exactly in the specified order, even if the value is "Not specified".
+16.⁠ ⁠Extract concise medical terms or phrases instead of copying long narrative sentences from the note.
+17. Symptoms must not be listed as diagnoses unless explicitly documented as a diagnosis in the note.
 
 Required output format:
 
