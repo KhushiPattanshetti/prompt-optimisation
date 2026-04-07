@@ -1,133 +1,108 @@
-"""Unit tests for model_loader module.
+"""Unit tests for rewriter model_loader module."""
 
-Tests:
-- SFT checkpoint loads if RL checkpoint absent
-- RL checkpoint loads when available
-- Tokenizer loads correctly
-"""
-
-import os
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
+import torch
 
-# Ensure the service root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from model_loader import _resolve_checkpoint_path, clear_cache, load_model
+import rewriter_inference_svc.model_loader as model_loader
 
 
-class TestResolveCheckpointPath:
-    """Tests for the checkpoint resolution logic."""
+def test_find_latest_checkpoint_dir_returns_highest_index(tmp_path, monkeypatch):
+    ckpt_root = tmp_path / "rl_checkpoints"
+    ckpt_root.mkdir()
+    (ckpt_root / "checkpoint_0002").mkdir()
+    (ckpt_root / "checkpoint_0010").mkdir()
+    (ckpt_root / "not_a_checkpoint").mkdir()
 
-    def test_sft_checkpoint_when_rl_empty(self, tmp_path: Path) -> None:
-        """When rl_checkpoints/ is empty, should fall back to sft_checkpoints/."""
-        rl_dir = tmp_path / "rl_checkpoints"
-        rl_dir.mkdir()
+    monkeypatch.setattr(model_loader, "RL_CHECKPOINT_PATH", ckpt_root)
 
-        sft_dir = tmp_path / "sft_checkpoints"
-        sft_dir.mkdir()
-        sft_ckpt = sft_dir / "checkpoint-100"
-        sft_ckpt.mkdir()
-
-        with patch("model_loader.RL_CHECKPOINT_PATH", str(rl_dir)), \
-             patch("model_loader.SFT_CHECKPOINT_PATH", str(sft_dir)):
-            resolved = _resolve_checkpoint_path()
-
-        assert resolved == sft_ckpt
-
-    def test_rl_checkpoint_loads_when_available(self, tmp_path: Path) -> None:
-        """When rl_checkpoints/ has checkpoints, should load the latest one."""
-        rl_dir = tmp_path / "rl_checkpoints"
-        rl_dir.mkdir()
-        ckpt_old = rl_dir / "checkpoint-100"
-        ckpt_old.mkdir()
-        ckpt_new = rl_dir / "checkpoint-200"
-        ckpt_new.mkdir()
-
-        # Make checkpoint-200 newer
-        os.utime(ckpt_old, (1000, 1000))
-        os.utime(ckpt_new, (2000, 2000))
-
-        sft_dir = tmp_path / "sft_checkpoints"
-        sft_dir.mkdir()
-
-        with patch("model_loader.RL_CHECKPOINT_PATH", str(rl_dir)), \
-             patch("model_loader.SFT_CHECKPOINT_PATH", str(sft_dir)):
-            resolved = _resolve_checkpoint_path()
-
-        assert resolved == ckpt_new
-
-    def test_raises_when_no_checkpoint_exists(self, tmp_path: Path) -> None:
-        """Should raise FileNotFoundError when no checkpoints exist at all."""
-        rl_dir = tmp_path / "rl_checkpoints"
-        sft_dir = tmp_path / "sft_checkpoints"
-
-        with patch("model_loader.RL_CHECKPOINT_PATH", str(rl_dir)), \
-             patch("model_loader.SFT_CHECKPOINT_PATH", str(sft_dir)):
-            with pytest.raises(FileNotFoundError):
-                _resolve_checkpoint_path()
+    latest = model_loader._find_latest_checkpoint_dir()
+    assert latest == ckpt_root / "checkpoint_0010"
 
 
-class TestLoadModel:
-    """Tests for the load_model function."""
+def test_build_value_head_loads_compatible_state_dict(tmp_path):
+    ckpt_dir = tmp_path / "checkpoint_0001"
+    ckpt_dir.mkdir()
+    value_path = ckpt_dir / "value_head.pt"
 
-    def setup_method(self) -> None:
-        clear_cache()
+    source_head = model_loader.ValueHead(hidden_size=model_loader.VALUE_HEAD_HIDDEN_SIZE, dropout=0.1)
+    randomized_state = {
+        name: torch.randn_like(tensor)
+        for name, tensor in source_head.state_dict().items()
+    }
+    torch.save(randomized_state, value_path)
 
-    @patch("model_loader.AutoTokenizer")
-    @patch("model_loader.AutoModelForCausalLM")
-    @patch("model_loader._resolve_checkpoint_path")
-    def test_tokenizer_loads_correctly(
-        self,
-        mock_resolve: MagicMock,
-        mock_model_cls: MagicMock,
-        mock_tokenizer_cls: MagicMock,
-        tmp_path: Path,
-    ) -> None:
-        """Tokenizer should be loaded from the resolved checkpoint path."""
-        ckpt = tmp_path / "ckpt"
-        ckpt.mkdir()
-        mock_resolve.return_value = ckpt
+    head = model_loader._build_value_head(torch.device("cpu"), ckpt_dir)
+    loaded_state = head.state_dict()
+    for key, tensor in randomized_state.items():
+        assert key in loaded_state
+        assert tuple(loaded_state[key].shape) == tuple(tensor.shape)
 
-        mock_model = MagicMock()
-        mock_param = MagicMock()
-        mock_param.device = "cpu"
-        mock_model.parameters.return_value = iter([mock_param])
-        mock_model_cls.from_pretrained.return_value.to.return_value = mock_model
 
-        mock_tokenizer = MagicMock()
-        mock_tokenizer_cls.from_pretrained.return_value = mock_tokenizer
+def test_build_value_head_fails_fast_for_legacy_linear_checkpoint(tmp_path):
+    ckpt_dir = tmp_path / "checkpoint_0001"
+    ckpt_dir.mkdir()
+    value_path = ckpt_dir / "value_head.pt"
 
-        model, tokenizer = load_model()
+    torch.save({"weight": torch.randn(1, model_loader.VALUE_HEAD_HIDDEN_SIZE)}, value_path)
 
-        mock_tokenizer_cls.from_pretrained.assert_called_once_with(
-            str(ckpt), trust_remote_code=True
-        )
-        assert tokenizer is mock_tokenizer
+    try:
+        model_loader._build_value_head(torch.device("cpu"), ckpt_dir)
+        assert False, "Expected RuntimeError for legacy single-linear value_head checkpoint"
+    except RuntimeError as exc:
+        assert "legacy single-linear value_head checkpoint" in str(exc)
 
-    @patch("model_loader.AutoTokenizer")
-    @patch("model_loader.AutoModelForCausalLM")
-    def test_model_loads_from_explicit_path(
-        self,
-        mock_model_cls: MagicMock,
-        mock_tokenizer_cls: MagicMock,
-        tmp_path: Path,
-    ) -> None:
-        """When an explicit checkpoint_path is given, it should be used directly."""
-        ckpt = tmp_path / "my_ckpt"
-        ckpt.mkdir()
 
-        mock_model = MagicMock()
-        mock_param = MagicMock()
-        mock_param.device = "cpu"
-        mock_model.parameters.return_value = iter([mock_param])
-        mock_model_cls.from_pretrained.return_value.to.return_value = mock_model
+def test_migrate_value_head_checkpoints_writes_marker(tmp_path, monkeypatch):
+    ckpt_root = tmp_path / "rl_checkpoints"
+    ckpt_root.mkdir()
+    ckpt_dir = ckpt_root / "checkpoint_0001"
+    ckpt_dir.mkdir()
 
-        load_model(checkpoint_path=ckpt)
+    source_head = model_loader.ValueHead(hidden_size=model_loader.VALUE_HEAD_HIDDEN_SIZE, dropout=0.1)
+    state = {
+        f"module.{name}": tensor
+        for name, tensor in source_head.state_dict().items()
+    }
+    torch.save(state, ckpt_dir / "value_head.pt")
 
-        mock_model_cls.from_pretrained.assert_called_once()
-        call_args = mock_model_cls.from_pretrained.call_args
-        assert call_args[0][0] == str(ckpt)
+    monkeypatch.setattr(model_loader, "RL_CHECKPOINT_PATH", ckpt_root)
+    model_loader._migrate_value_head_checkpoints_once()
+
+    marker = ckpt_root / ".value_head_migration_v2.json"
+    assert marker.exists()
+
+    migrated_state = torch.load(ckpt_dir / "value_head.pt", map_location="cpu")
+    assert all(not key.startswith("module.") for key in migrated_state.keys())
+
+
+def test_load_model_caches_instances(monkeypatch):
+    model_loader.clear_cache()
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = None
+    tokenizer.eos_token = "<eos>"
+
+    base_model = MagicMock()
+    base_model.config = MagicMock()
+    base_model.gradient_checkpointing_disable = MagicMock()
+    base_model.disable_input_require_grads = MagicMock()
+    base_model.eval = MagicMock()
+    base_param = torch.nn.Parameter(torch.zeros(1))
+    base_model.parameters.return_value = iter([base_param])
+
+    monkeypatch.setattr(model_loader, "_find_latest_checkpoint_dir", lambda: None)
+    monkeypatch.setattr(model_loader, "_migrate_value_head_checkpoints_once", lambda: None)
+
+    with patch("rewriter_inference_svc.model_loader.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+         patch("rewriter_inference_svc.model_loader.AutoModelForCausalLM.from_pretrained", return_value=base_model):
+        model_1, tok_1, vh_1 = model_loader.load_model()
+        model_2, tok_2, vh_2 = model_loader.load_model()
+
+    assert model_1 is base_model
+    assert model_1 is model_2
+    assert tok_1 is tok_2
+    assert vh_1 is vh_2
+
+    model_loader.clear_cache()

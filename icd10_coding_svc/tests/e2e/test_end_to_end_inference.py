@@ -9,12 +9,9 @@ Prerequisites:
 
 import glob
 import os
-import sys
 
 import pytest
 import requests
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 try:
     import torch
@@ -25,7 +22,10 @@ except ImportError:
 BASE_URL = "http://localhost:8001"
 SAMPLE_NOTE_ID = "12345"
 
-pytestmark = pytest.mark.skipif(not GPU_AVAILABLE, reason="GPU required for e2e tests")
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.skipif(not GPU_AVAILABLE, reason="GPU required for e2e tests"),
+]
 
 
 def _service_is_live() -> bool:
@@ -61,7 +61,7 @@ class TestFullInferenceCycle:
 
 class TestGtCodesPersistedToDisk:
     def test_gt_codes_file_exists(self):
-        from config import GT_CODES_PATH
+        from icd10_coding_svc.config import GT_CODES_PATH
         import json
 
         path = os.path.join(GT_CODES_PATH, f"{SAMPLE_NOTE_ID}.json")
@@ -73,7 +73,7 @@ class TestGtCodesPersistedToDisk:
 
 class TestInferenceOutputPersistedToDisk:
     def test_output_file_exists(self):
-        from config import OUTPUT_PATH
+        from icd10_coding_svc.config import OUTPUT_PATH
         import json
 
         pattern = os.path.join(OUTPUT_PATH, f"{SAMPLE_NOTE_ID}_*.json")

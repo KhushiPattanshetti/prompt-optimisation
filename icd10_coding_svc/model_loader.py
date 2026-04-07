@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Tuple
+from pathlib import Path
 
 import torch
 from transformers import (
@@ -22,8 +23,8 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from config import MODEL_NAME, LOCAL_CACHE_PATH
-from logger import get_logger
+from icd10_coding_svc.config import MODEL_NAME, LOCAL_CACHE_PATH
+from icd10_coding_svc.logger import get_logger
 
 log = get_logger("model_loader")
 
@@ -55,8 +56,9 @@ def load_model() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     if _cached_model is not None and _cached_tokenizer is not None:
         return _cached_model, _cached_tokenizer
 
-    cache_exists = os.path.isdir(LOCAL_CACHE_PATH)
-    source = LOCAL_CACHE_PATH if cache_exists else MODEL_NAME
+    cache_dir = Path(LOCAL_CACHE_PATH)
+    cache_exists = cache_dir.is_dir() and (cache_dir / "config.json").exists()
+    source = str(cache_dir) if cache_exists else MODEL_NAME
 
     if cache_exists:
         log.info("Loading Med42 from local cache: %s", LOCAL_CACHE_PATH)

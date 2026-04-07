@@ -1,0 +1,167 @@
+services:
+  dataset_svc:
+    build: .
+    container_name: dataset_svc
+    command: uvicorn dataset_svc.app:app --host 0.0.0.0 --port 8003
+    ports: ["8003:8003"]
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONPATH=/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  rewriter_svc:
+    build: .
+    container_name: rewriter_svc
+    command: uvicorn rewriter_inference_svc.app:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache
+      - ./rl_checkpoints:/app/rl_checkpoints
+      - ./sft_checkpoints:/app/sft_checkpoints
+      - ./inference_outputs:/app/inference_outputs
+      - ./best_prompts_cache:/app/best_prompts_cache
+    environment:
+      - PYTHONPATH=/app
+      - RL_CHECKPOINT_DIR=${REWRITER_CHECKPOINT_DIR:-/app/rl_checkpoints}
+      - HF_HOME=/app/hf_cache
+      - REWRITER_MODEL_VARIANT=${REWRITER_MODEL_VARIANT:-base}
+      - REWRITER_INPUT_MODE=${REWRITER_INPUT_MODE:-dynamic}
+      - REWRITER_ENABLE_POSTFILTER_GUARD=${REWRITER_ENABLE_POSTFILTER_GUARD:-true}
+      - REWRITER_GUARD_MIN_KEYWORD_HITS=${REWRITER_GUARD_MIN_KEYWORD_HITS:-2}
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+    depends_on:
+      dataset_svc:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  icd10_svc:
+    build: .
+    container_name: icd10_svc
+    command: uvicorn icd10_coding_svc.app:app --host 0.0.0.0 --port 8001
+    ports: ["8001:8001"]
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache
+      - ./inference_outputs:/app/inference_outputs
+      - ./gt_codes:/app/gt_codes
+    environment:
+      - PYTHONPATH=/app
+      - DATASET_SVC_URL=http://dataset_svc:8003
+      - REWARD_SERVICE_URL=http://reward_svc:8002
+      - HF_HOME=/app/hf_cache
+      - NVIDIA_VISIBLE_DEVICES=1
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+    depends_on:
+      dataset_svc:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  reward_svc:
+    build: .
+    container_name: reward_svc
+    command: uvicorn reward_metrics_svc.main:app --host 0.0.0.0 --port 8002
+    ports: ["8002:8002"]
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache
+      - ./reward_queue:/app/reward_queue
+    environment:
+      - PYTHONPATH=/app
+      - RL_BLOCK_ENDPOINT=http://rl_loop_svc:8004/rollout
+      - ROLLOUT_QUEUE_DIR=/app/reward_queue
+      - ROLLOUT_REQUIRE_PARSE_COMPARABILITY=${ROLLOUT_REQUIRE_PARSE_COMPARABILITY:-true}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  rl_loop_svc:
+    build: .
+    container_name: rl_loop_svc
+    command: uvicorn rl_loop_svc.app.main:app --host 0.0.0.0 --port 8004
+    ports: ["8004:8004"]
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache
+      - ./rl_checkpoints:/app/rl_checkpoints
+      - ./rl_loop_svc/rollouts:/app/rl_loop_svc/rollouts
+    environment:
+      - PYTHONPATH=/app
+      - RL_CHECKPOINT_DIR=/app/rl_checkpoints
+      - REWRITER_SERVICE_URL=http://rewriter_svc:8000
+      - HF_HOME=/app/hf_cache
+      - NVIDIA_VISIBLE_DEVICES=0,1,2,3
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - RL_MODEL_NAME=microsoft/Phi-3-mini-4k-instruct
+      - RL_HIDDEN_SIZE=3072
+      - RL_POLICY_CUDA_DEVICE=2
+      - RL_REFERENCE_CUDA_DEVICE=3
+      - RL_BATCH_SIZE=${RL_BATCH_SIZE:-4}
+      - RL_GRADIENT_ACCUMULATION_STEPS=4
+      - RL_POLICY_MAX_LENGTH=${RL_POLICY_MAX_LENGTH:-1024}
+      - RL_DISTRIBUTED_ENABLED=false
+      - RL_DISTRIBUTED_WORLD_SIZE=4
+      - RL_DISTRIBUTED_MIN_FREE_RAM_GB=64
+      - RL_DISTRIBUTED_MIN_FREE_VRAM_GB_PER_GPU=8
+      - RL_DISTRIBUTED_LAUNCH_TIMEOUT_SECONDS=7200
+      - RL_PPO_DEBUG_MODE=${RL_PPO_DEBUG_MODE:-false}
+      - RL_PPO_DEBUG_DISABLE_KL_SKIP=${RL_PPO_DEBUG_DISABLE_KL_SKIP:-false}
+      - RL_PPO_DEBUG_DISABLE_INVALID_SPAN_SKIP=${RL_PPO_DEBUG_DISABLE_INVALID_SPAN_SKIP:-false}
+      - RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION=${RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION:-false}
+      - RL_PPO_DEBUG_CLAMP_ADVANTAGES=${RL_PPO_DEBUG_CLAMP_ADVANTAGES:-false}
+      - RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS=${RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS:-false}
+    depends_on:
+      dataset_svc:
+        condition: service_healthy
+      reward_svc:
+        condition: service_healthy
+      rewriter_svc:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+

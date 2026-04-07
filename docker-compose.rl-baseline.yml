@@ -1,0 +1,15 @@
+services:
+  rl_loop_svc:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=2,3
+      - RL_DISTRIBUTED_ENABLED=false
+      - RL_DISTRIBUTED_WORLD_SIZE=1
+      - RL_POLICY_CUDA_DEVICE=0
+      - RL_REFERENCE_CUDA_DEVICE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]

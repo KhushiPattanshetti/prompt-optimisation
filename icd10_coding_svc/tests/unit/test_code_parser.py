@@ -1,9 +1,4 @@
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from code_parser import parse_icd10_codes, validate_code
+from icd10_coding_svc.code_parser import parse_icd10_codes, validate_code
 
 
 class TestValidateCode:
@@ -58,3 +53,13 @@ class TestParseICD10Codes:
         raw = '["I21", "E11"]'
         result = parse_icd10_codes(raw)
         assert result == ["I21", "E11"]
+
+    def test_parse_codes_without_decimal_suffix(self):
+        raw = '["I209", "E119"]'
+        result = parse_icd10_codes(raw)
+        assert result == ["I20.9", "E11.9"]
+
+    def test_parse_regex_undotted_and_lowercase_codes(self):
+        raw = "Assessment: i209 and e119 are relevant diagnoses."
+        result = parse_icd10_codes(raw)
+        assert result == ["I20.9", "E11.9"]

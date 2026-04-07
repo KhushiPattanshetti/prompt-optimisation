@@ -1,0 +1,16 @@
+services:
+  rl_loop_svc:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${DIST_VISIBLE_DEVICES:-0,1,2,3}
+      - RL_DISTRIBUTED_ENABLED=true
+      - RL_DISTRIBUTED_WORLD_SIZE=${DIST_WORLD_SIZE:-4}
+      - RL_DISTRIBUTED_MIN_FREE_RAM_GB=${DIST_MIN_FREE_RAM_GB:-64}
+      - RL_DISTRIBUTED_MIN_FREE_VRAM_GB_PER_GPU=${DIST_MIN_FREE_VRAM_GB:-8}
+      - RL_DISTRIBUTED_LAUNCH_TIMEOUT_SECONDS=${DIST_LAUNCH_TIMEOUT_SECONDS:-7200}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]

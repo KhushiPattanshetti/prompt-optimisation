@@ -1,0 +1,17 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+venv
+.venv
+*.egg-info
+data/*.csv
+hf_cache
+rl_checkpoints
+inference_outputs
+gt_codes
+best_prompts_cache
+logs
+*.log
+rollouts

@@ -1,30 +1,22 @@
-"""Inference engine for icd10_coding_svc.
-
-FIXES APPLIED:
-    - threading.Lock scope tightened: only wraps model.generate() GPU calls.
-      Previously the entire run_inference() was inside the lock, blocking
-      /health and other non-GPU work.
-    - Added one retry with 2-second delay on reward service forwarding.
-      Previously a network failure would silently drop the reward signal.
-"""
-
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
 import requests
+import torch
 
-import code_parser
-import gt_fetcher
-import model_loader
-from config import (
+from icd10_coding_svc import code_parser, gt_fetcher, model_loader
+from icd10_coding_svc.config import (
     DO_SAMPLE,
+    ICD_INPUT_MAX_LENGTH,
+    ICD_PARSE_RECOVERY_ENABLED,
+    ICD_PARSE_RECOVERY_MAX_NOTE_CHARS,
     MAX_NEW_TOKENS,
     OUTPUT_PATH,
     REPETITION_PENALTY,
@@ -32,20 +24,25 @@ from config import (
     SYSTEM_INSTRUCTION,
     TEMPERATURE,
 )
-from logger import get_logger
+from icd10_coding_svc.logger import get_logger
 
 log = get_logger("inference_engine")
 
-# Serialises GPU inference calls only — not file I/O or HTTP calls
 _inference_lock = threading.Lock()
+_observability_lock = threading.Lock()
+_observability_state = {
+    "total_requests": 0,
+    "parse_success": 0,
+    "enhanced_parse_failures": 0,
+    "original_parse_failures": 0,
+    "both_parse_failures": 0,
+    "joint_failure_modes": defaultdict(int),
+    "enhanced_failure_reasons": defaultdict(int),
+    "original_failure_reasons": defaultdict(int),
+}
 
-
-# ---------------------------------------------------------------------------
-# Prompt formatting
-# ---------------------------------------------------------------------------
 
 def _format_prompt(prompt: str) -> str:
-    """Wrap prompt in Llama-3 chat template."""
     return (
         "<|begin_of_text|>"
         "<|start_header_id|>system<|end_header_id|>\n"
@@ -58,21 +55,151 @@ def _format_prompt(prompt: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Single GPU inference pass (must be called inside _inference_lock)
-# ---------------------------------------------------------------------------
+def _classify_failure_reason(raw_output: str) -> str:
+    text = str(raw_output or "").strip()
+    if not text:
+        return "empty_output"
+    if "[" in text or "{" in text:
+        return "json_like_no_valid_codes"
+    return "no_valid_icd_pattern"
+
+
+def _record_parse_observability(
+    enh_raw: str,
+    org_raw: str,
+    enh_codes: List[str],
+    org_codes: List[str],
+) -> None:
+    enh_ok = bool(enh_codes)
+    org_ok = bool(org_codes)
+
+    with _observability_lock:
+        _observability_state["total_requests"] += 1
+        if enh_ok or org_ok:
+            _observability_state["parse_success"] += 1
+
+        if not enh_ok:
+            _observability_state["enhanced_parse_failures"] += 1
+            reason = _classify_failure_reason(enh_raw)
+            _observability_state["enhanced_failure_reasons"][reason] += 1
+
+        if not org_ok:
+            _observability_state["original_parse_failures"] += 1
+            reason = _classify_failure_reason(org_raw)
+            _observability_state["original_failure_reasons"][reason] += 1
+
+        if not enh_ok and not org_ok:
+            _observability_state["both_parse_failures"] += 1
+            _observability_state["joint_failure_modes"]["both_failed"] += 1
+        elif not enh_ok:
+            _observability_state["joint_failure_modes"]["enhanced_failed_only"] += 1
+        elif not org_ok:
+            _observability_state["joint_failure_modes"]["original_failed_only"] += 1
+
+
+def get_observability_snapshot() -> Dict[str, Any]:
+    with _observability_lock:
+        total_requests = int(_observability_state["total_requests"])
+        parse_success = int(_observability_state["parse_success"])
+        enhanced_parse_failures = int(_observability_state["enhanced_parse_failures"])
+        original_parse_failures = int(_observability_state["original_parse_failures"])
+        both_parse_failures = int(_observability_state["both_parse_failures"])
+        joint_failure_modes = dict(_observability_state["joint_failure_modes"])
+        enhanced_failure_reasons = dict(_observability_state["enhanced_failure_reasons"])
+        original_failure_reasons = dict(_observability_state["original_failure_reasons"])
+
+    parse_failure_total = enhanced_parse_failures + original_parse_failures
+    return {
+        "total_requests": total_requests,
+        "parse_success_rate": (parse_success / total_requests) if total_requests else 0.0,
+        "enhanced_parse_failures": enhanced_parse_failures,
+        "original_parse_failures": original_parse_failures,
+        "both_parse_failures": both_parse_failures,
+        "parse_failure_total": parse_failure_total,
+        "parse_failure_taxonomy": {
+            "joint_failure_modes": joint_failure_modes,
+            "enhanced_failure_reasons": enhanced_failure_reasons,
+            "original_failure_reasons": original_failure_reasons,
+        },
+    }
+
+
+def _truncate_note_for_recovery(note_text: str, max_chars: int) -> str:
+    note = str(note_text or "").strip()
+    if len(note) <= max_chars:
+        return note
+    if max_chars <= 64:
+        return note[:max_chars]
+
+    head_len = int(max_chars * 0.7)
+    tail_len = max_chars - head_len - 5
+    if tail_len <= 0:
+        return note[:max_chars]
+
+    return f"{note[:head_len].rstrip()}\n...\n{note[-tail_len:].lstrip()}"
+
+
+def _extract_clinical_note(prompt: str) -> str:
+    text = str(prompt or "")
+    marker = "Clinical note:"
+    idx = text.lower().find(marker.lower())
+    if idx >= 0:
+        extracted = text[idx + len(marker):].strip()
+        if extracted:
+            return extracted
+    return text.strip()
+
+
+def _build_recovery_prompt(prompt: str) -> str:
+    note_text = _extract_clinical_note(prompt)
+    clipped_note = _truncate_note_for_recovery(
+        note_text=note_text,
+        max_chars=ICD_PARSE_RECOVERY_MAX_NOTE_CHARS,
+    )
+    return (
+        "Extract all ICD-10-CM diagnosis codes from the clinical note below.\n"
+        "Return only a JSON array of code strings, for example [\"I10\", \"E11.9\"].\n"
+        "If no diagnosis codes are present, return [].\n\n"
+        f"Clinical note:\n{clipped_note}\n\n"
+        "JSON:"
+    )
+
+
+def _recover_parse_if_needed(
+    prompt: str,
+    raw_output: str,
+    parsed_codes: List[str],
+    model,
+    tokenizer,
+    branch: str,
+) -> Tuple[str, List[str], bool]:
+    if parsed_codes or not ICD_PARSE_RECOVERY_ENABLED:
+        return raw_output, parsed_codes, False
+
+    recovery_prompt = _build_recovery_prompt(prompt)
+    recovery_raw = _run_single_pass(recovery_prompt, model, tokenizer)
+    recovery_codes = code_parser.parse_icd10_codes(recovery_raw, warn_on_empty=False)
+    if recovery_codes:
+        log.info(
+            "parse_recovery_success | branch=%s | recovered_codes=%d",
+            branch,
+            len(recovery_codes),
+        )
+        return recovery_raw, recovery_codes, True
+
+    return raw_output, parsed_codes, False
+
 
 def _run_single_pass(prompt: str, model, tokenizer) -> str:
-    """Run one inference pass and return raw decoded text."""
     formatted = _format_prompt(prompt)
-    encoding  = tokenizer(
+    encoding = tokenizer(
         formatted,
         return_tensors="pt",
         truncation=True,
-        max_length=1024,
+        max_length=ICD_INPUT_MAX_LENGTH,
     ).to(model.device)
 
-    input_len  = encoding["input_ids"].shape[1]
+    input_len = encoding["input_ids"].shape[1]
     output_ids = model.generate(
         **encoding,
         max_new_tokens=MAX_NEW_TOKENS,
@@ -85,137 +212,149 @@ def _run_single_pass(prompt: str, model, tokenizer) -> str:
     return tokenizer.decode(new_ids[0], skip_special_tokens=True)
 
 
-# ---------------------------------------------------------------------------
-# Downstream forwarding
-# ---------------------------------------------------------------------------
-
 def _forward_to_reward_service(payload: Dict[str, Any]) -> None:
-    """POST results to reward_metric_svc with one retry on failure.
-
-    FIX: Previously fire-and-forget. A single network failure would
-    silently drop the reward for that rollout with no indication.
-    """
-    url = f"{REWARD_SERVICE_URL}/compute_reward"
+    url = f"{REWARD_SERVICE_URL}/reward"
     for attempt in range(2):
         try:
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code == 200:
-                log.info("reward_forwarded | note_id=%s", payload.get("note_id"))
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code < 400:
                 return
             log.warning(
-                "reward_forward_bad_status | status=%d | attempt=%d",
-                resp.status_code, attempt + 1,
+                "reward_forward_bad_status | attempt=%d | status=%d",
+                attempt + 1,
+                response.status_code,
             )
         except requests.RequestException as exc:
             log.warning(
-                "reward_forward_error | attempt=%d | error=%s", attempt + 1, exc
+                "reward_forward_error | attempt=%d | error=%s",
+                attempt + 1,
+                exc,
             )
         if attempt == 0:
             time.sleep(2)
 
-    log.error(
-        "reward_forward_failed | note_id=%s | all retries exhausted",
-        payload.get("note_id"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Output persistence
-# ---------------------------------------------------------------------------
 
 def _save_output(data: Dict[str, Any]) -> None:
-    """Save inference result to disk."""
     os.makedirs(OUTPUT_PATH, exist_ok=True)
-    ts       = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     filename = f"{data['note_id']}_{ts.replace(':', '-')}.json"
-    path     = os.path.join(OUTPUT_PATH, filename)
-    data["timestamp"] = ts
+    path = os.path.join(OUTPUT_PATH, filename)
+    payload = dict(data)
+    payload["timestamp"] = ts
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    log.info("output_saved | path=%s", path)
+        json.dump(payload, f, indent=2)
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def run_inference(
     note_id: str,
     original_prompt: str,
     rewritten_prompt: str,
+    log_prob_old: Optional[float] = None,
+    value_estimate: Optional[float] = None,
+    run_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    generation_source: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run dual inference passes and fetch ground truth codes.
-
-    Steps:
-        1. Fetch gt_codes from dataset_svc via gt_fetcher (HTTP, no lock).
-        2. Acquire GPU lock.
-        3. Enhanced pass: rewritten_prompt → enh_codes.
-        4. Original pass: original_prompt  → org_codes.
-        5. Release GPU lock.
-        6. Parse codes from raw outputs.
-        7. Save to disk (I/O, no lock).
-        8. Forward to reward_metric_svc asynchronously.
-        9. Return structured response.
-
-    Args:
-        note_id:          Identifier used to fetch gt_codes from dataset_svc.
-        original_prompt:  Unmodified prompt (baseline, no rewriting).
-        rewritten_prompt: Enhanced prompt from Prompt Rewriter Service.
-
-    Returns:
-        Dict matching CodeResponse schema.
-    """
-    # Step 1: fetch gt_codes — HTTP call, outside GPU lock
     gt_codes: List[str] = gt_fetcher.get_gt_codes(note_id)
-    log.info("gt_codes_fetched | note_id=%s | count=%d", note_id, len(gt_codes))
-
     model, tokenizer = model_loader.load_model()
 
-    # Steps 2-4: both GPU passes inside one lock acquisition
     with _inference_lock:
         with torch.no_grad():
             enh_raw = _run_single_pass(rewritten_prompt, model, tokenizer)
-            org_raw = _run_single_pass(original_prompt,  model, tokenizer)
+            org_raw = _run_single_pass(original_prompt, model, tokenizer)
+            enh_codes = code_parser.parse_icd10_codes(enh_raw, warn_on_empty=False)
+            org_codes = code_parser.parse_icd10_codes(org_raw, warn_on_empty=False)
+            enh_raw, enh_codes, enh_recovery_used = _recover_parse_if_needed(
+                prompt=rewritten_prompt,
+                raw_output=enh_raw,
+                parsed_codes=enh_codes,
+                model=model,
+                tokenizer=tokenizer,
+                branch="enhanced",
+            )
+            org_raw, org_codes, org_recovery_used = _recover_parse_if_needed(
+                prompt=original_prompt,
+                raw_output=org_raw,
+                parsed_codes=org_codes,
+                model=model,
+                tokenizer=tokenizer,
+                branch="original",
+            )
 
-    # Parse codes (CPU, outside lock)
-    enh_codes: List[str] = code_parser.parse_icd10_codes(enh_raw)
-    org_codes: List[str] = code_parser.parse_icd10_codes(org_raw)
-    parsing_success      = bool(enh_codes or org_codes)
-
-    log.info(
-        "codes_parsed | note_id=%s | enh=%d | org=%d | success=%s",
-        note_id, len(enh_codes), len(org_codes), parsing_success,
+    enh_parse_ok = bool(enh_codes)
+    org_parse_ok = bool(org_codes)
+    both_parse_success = bool(enh_parse_ok and org_parse_ok)
+    parsing_success = bool(enh_codes or org_codes)
+    _record_parse_observability(
+        enh_raw=enh_raw,
+        org_raw=org_raw,
+        enh_codes=enh_codes,
+        org_codes=org_codes,
     )
 
-    result: Dict[str, Any] = {
-        "note_id":          note_id,
-        "enh_codes":        enh_codes,
-        "org_codes":        org_codes,
-        "gt_codes":         gt_codes,
-        "enh_raw_output":   enh_raw,
-        "org_raw_output":   org_raw,
-        "parsing_success":  parsing_success,
-        "rewritten_prompt": rewritten_prompt,
-        "original_prompt":  original_prompt,
-    }
+    if not parsing_success:
+        log.warning(
+            "parse_failed_both_prompts | note_id=%s | enh_recovery=%s | org_recovery=%s",
+            note_id,
+            enh_recovery_used,
+            org_recovery_used,
+        )
 
-    # Save to disk
-    _save_output(result)
-
-    # Forward to reward service in background thread
-    reward_payload = {
-        "note_id":   note_id,
-        "gt_codes":  gt_codes,
+    output_payload: Dict[str, Any] = {
+        "note_id": note_id,
+        "run_id": run_id,
+        "group_id": group_id,
+        "gt_codes": gt_codes,
         "enh_codes": enh_codes,
         "org_codes": org_codes,
+        "original_prompt": original_prompt,
+        "rewritten_prompt": rewritten_prompt,
+        "generation_source": generation_source,
+        "log_prob_old": log_prob_old,
+        "value_estimate": value_estimate,
+        "enh_raw_output": enh_raw,
+        "org_raw_output": org_raw,
+        "parsing_success": parsing_success,
+        "enh_parse_ok": enh_parse_ok,
+        "org_parse_ok": org_parse_ok,
+        "both_parse_success": both_parse_success,
+        "enh_recovery_used": enh_recovery_used,
+        "org_recovery_used": org_recovery_used,
     }
-    threading.Thread(
-        target=_forward_to_reward_service,
-        args=(reward_payload,),
-        daemon=True,
-    ).start()
 
-    return result
+    _save_output(output_payload)
+
+    _forward_to_reward_service(
+        {
+            "note_id": note_id,
+            "run_id": run_id,
+            "group_id": group_id,
+            "gt_codes": gt_codes,
+            "enh_codes": enh_codes,
+            "org_codes": org_codes,
+            "enh_parse_ok": enh_parse_ok,
+            "org_parse_ok": org_parse_ok,
+            "both_parse_success": both_parse_success,
+            "original_prompt": original_prompt,
+            "rewritten_prompt": rewritten_prompt,
+            "generation_source": generation_source,
+            "log_prob_old": log_prob_old,
+            "value_estimate": value_estimate,
+        }
+    )
+
+    return {
+        "note_id": note_id,
+        "enh_codes": enh_codes,
+        "org_codes": org_codes,
+        "gt_codes": gt_codes,
+        "enh_raw_output": enh_raw,
+        "org_raw_output": org_raw,
+        "parsing_success": parsing_success,
+        "enh_parse_ok": enh_parse_ok,
+        "org_parse_ok": org_parse_ok,
+        "both_parse_success": both_parse_success,
+    }
 
 # import json
 # import os

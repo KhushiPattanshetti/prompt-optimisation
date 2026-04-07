@@ -1,64 +1,29 @@
-"""
-Policy model: Phi-3-mini with 4-bit NF4 quantization and LoRA adapter.
-
-FIX SUMMARY (from review):
-  - Previously loaded model at full precision with no quantization.
-    Loading Phi-3 twice (policy + reference) at float32/bfloat16 =
-    ~15GB VRAM just for the two LMs, leaving no room for Med42.
-  - Now loads in 4-bit NF4 quantization (~3.8GB per model).
-  - LoRA adapter attached so only ~3M params are trained, not 3.8B.
-  - enable_input_require_grads() called for gradient checkpointing
-    compatibility with quantized model.
-"""
-
-import logging
+from pathlib import Path
+import os
 from typing import Optional, Tuple
+import logging
 
 import torch
 import torch.nn as nn
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    PreTrainedModel,
-)
-from peft import LoraConfig, get_peft_model, PeftModel
+import torch.nn.functional as F
+from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 
 logger = logging.getLogger(__name__)
 
-# LoRA config matching rewriter_inference_svc
-_LORA_CONFIG = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-
-
-def _build_bnb_config() -> BitsAndBytesConfig:
-    return BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-
 
 class PolicyModel(nn.Module):
-    """
-    Phi-3-mini loaded in 4-bit NF4 with a LoRA adapter.
+    @staticmethod
+    def _resolve_compute_dtype(device: torch.device) -> torch.dtype:
+        if device.type != "cuda":
+            return torch.float32
 
-    Only LoRA weights (~3M params) are trainable.
-    The base 3.8B weights remain frozen (quantized).
-
-    Args:
-        model_name: HuggingFace model identifier.
-        checkpoint_path: Optional path to an RL checkpoint lora_adapter/ dir.
-                         If None, a fresh LoRA adapter is attached.
-        device: Torch device (auto-detected if None).
-    """
+        index = device.index if device.index is not None else 0
+        major, _ = torch.cuda.get_device_capability(index)
+        if major >= 8:
+            return torch.bfloat16
+        return torch.float16
 
     def __init__(
         self,
@@ -67,222 +32,220 @@ class PolicyModel(nn.Module):
         device: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if self.device.type == "cuda":
+            target_index = self.device.index if self.device.index is not None else 0
+            device_map = {"": target_index}
+        else:
+            device_map = "auto"
+
+        compute_dtype = self._resolve_compute_dtype(self.device)
+
         logger.info(
-            "Loading policy model (4-bit NF4): %s on %s", model_name, self.device
+            "policy_model_init | model=%s | requested_device=%s | device_map=%s | compute_dtype=%s | checkpoint=%s",
+            model_name,
+            self.device,
+            device_map,
+            compute_dtype,
+            checkpoint_path,
         )
 
-        bnb_config = _build_bnb_config()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        base = AutoModelForCausalLM.from_pretrained(
+        self.training_max_length = int(os.environ.get("RL_POLICY_MAX_LENGTH", "1024"))
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+
+        base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+            torch_dtype=compute_dtype,
             trust_remote_code=True,
         )
-        base.config.use_cache = False
+        base_model.config.use_cache = False
 
-        # Attach LoRA — load from checkpoint or fresh
         if checkpoint_path is not None:
-            logger.info("Loading LoRA adapter from: %s", checkpoint_path)
-            self.model: PreTrainedModel = PeftModel.from_pretrained(
-                base, checkpoint_path, is_trainable=True
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                checkpoint_path,
+                is_trainable=True,
             )
         else:
-            logger.info("Attaching fresh LoRA adapter")
-            self.model = get_peft_model(base, _LORA_CONFIG)
+            peft_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.model = get_peft_model(base_model, peft_config)
 
         self.model.enable_input_require_grads()
         self.model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
 
-        trainable = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
-        logger.info("PolicyModel ready | trainable_params=%d", trainable)
-
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
-
-        Returns:
-            log_probs:    per-token log-probabilities, shape (B, T-1).
-            hidden_states: last hidden layer, shape (B, T, H).
-        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        logits = outputs.logits                        # (B, T, V)
-        log_probs = torch.log_softmax(logits, dim=-1)  # (B, T, V)
 
-        # Shift: position i predicts token i+1
-        shift_log_probs = log_probs[:, :-1, :]         # (B, T-1, V)
-        shift_labels    = input_ids[:, 1:]              # (B, T-1)
-        token_log_probs = torch.gather(
-            shift_log_probs, dim=2, index=shift_labels.unsqueeze(-1)
-        ).squeeze(-1)                                   # (B, T-1)
+        logits = outputs.logits[:, :-1, :]
+        target_ids = input_ids[:, 1:]
+        token_log_probs = F.log_softmax(logits, dim=-1).gather(
+            dim=-1,
+            index=target_ids.unsqueeze(-1),
+        ).squeeze(-1)
 
-        last_hidden = outputs.hidden_states[-1]         # (B, T, H)
-        return token_log_probs, last_hidden
+        last_hidden_states = outputs.hidden_states[-1]
+        return token_log_probs, last_hidden_states
 
     def get_sequence_log_prob(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Sum log-probs over sequence → scalar per sample. Shape (B,)."""
-        token_lp, _ = self.forward(input_ids, attention_mask)
-        return token_lp.sum(dim=-1)
+        token_log_probs, _ = self.forward(input_ids, attention_mask)
+        return token_log_probs.sum(dim=-1)
 
-    def tokenize(self, texts: list) -> dict:
-        """Tokenise a list of strings and move tensors to device."""
+    def tokenize(self, texts: list[str]) -> dict[str, torch.Tensor]:
         encoded = self.tokenizer(
             texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=self.training_max_length,
         )
-        return {k: v.to(self.device) for k, v in encoded.items()}
+        return {key: value.to(self.device) for key, value in encoded.items()}
+
+    def tokenize_with_action_mask(
+        self,
+        original_texts: list[str],
+        rewritten_texts: list[str],
+    ) -> dict[str, torch.Tensor]:
+        if len(original_texts) != len(rewritten_texts):
+            raise ValueError("original_texts and rewritten_texts must have identical length")
+
+        max_len = max(int(self.training_max_length), 2)
+        separator_ids = self.tokenizer("\n\n", add_special_tokens=False)["input_ids"]
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        if self.tokenizer.bos_token_id is not None:
+            fallback_prefix_token = int(self.tokenizer.bos_token_id)
+        elif self.tokenizer.eos_token_id is not None:
+            fallback_prefix_token = int(self.tokenizer.eos_token_id)
+        else:
+            fallback_prefix_token = int(pad_token_id)
+
+        input_id_rows: list[list[int]] = []
+        action_mask_rows: list[list[float]] = []
+        valid_actions: list[bool] = []
+        rewrite_span_starts: list[int] = []
+        rewrite_span_ends: list[int] = []
+        tokenized_lengths: list[int] = []
+
+        for original, rewritten in zip(original_texts, rewritten_texts):
+            original_ids = self.tokenizer(original, add_special_tokens=False)["input_ids"]
+            rewritten_ids = self.tokenizer(rewritten, add_special_tokens=False)["input_ids"]
+
+            # Preserve rewritten tokens first and truncate prefix context when needed.
+            max_rewrite_tokens = max_len - 1
+            if len(rewritten_ids) > max_rewrite_tokens:
+                rewritten_ids = rewritten_ids[:max_rewrite_tokens]
+
+            prefix_budget = max_len - len(rewritten_ids)
+            prefix_ids = (original_ids + separator_ids)[: max(prefix_budget, 0)]
+
+            if not prefix_ids:
+                prefix_ids = [fallback_prefix_token]
+                if len(prefix_ids) + len(rewritten_ids) > max_len:
+                    rewritten_ids = rewritten_ids[: max_len - len(prefix_ids)]
+
+            combined_ids = prefix_ids + rewritten_ids
+            if not combined_ids:
+                combined_ids = [fallback_prefix_token]
+
+            seq_len = len(combined_ids)
+            seq_token_logprob_len = max(seq_len - 1, 0)
+            rewrite_start_token = min(len(prefix_ids), seq_len)
+            start = max(rewrite_start_token - 1, 0)
+
+            row_action_mask = [0.0] * seq_token_logprob_len
+            has_rewrite_span = seq_token_logprob_len > start and len(rewritten_ids) > 0
+            if has_rewrite_span:
+                for pos in range(start, seq_token_logprob_len):
+                    row_action_mask[pos] = 1.0
+                rewrite_span_starts.append(start)
+                rewrite_span_ends.append(seq_token_logprob_len - 1)
+            else:
+                rewrite_span_starts.append(-1)
+                rewrite_span_ends.append(-1)
+
+            input_id_rows.append(combined_ids)
+            action_mask_rows.append(row_action_mask)
+            valid_actions.append(has_rewrite_span)
+            tokenized_lengths.append(seq_len)
+
+        encoded = self.tokenizer.pad(
+            {"input_ids": input_id_rows},
+            padding=True,
+            return_tensors="pt",
+        )
+
+        input_ids = encoded["input_ids"]
+        action_width = max(input_ids.shape[1] - 1, 0)
+        action_mask = torch.zeros((input_ids.shape[0], action_width), dtype=torch.float32)
+
+        for idx, row in enumerate(action_mask_rows):
+            if not row:
+                continue
+            width = min(len(row), action_width)
+            action_mask[idx, :width] = torch.tensor(row[:width], dtype=torch.float32)
+
+        payload = {key: value.to(self.device) for key, value in encoded.items()}
+        payload["action_mask"] = action_mask.to(self.device)
+        payload["valid_action"] = torch.tensor(valid_actions, dtype=torch.bool, device=self.device)
+        payload["rewrite_span_start"] = torch.tensor(
+            rewrite_span_starts,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        payload["rewrite_span_end"] = torch.tensor(
+            rewrite_span_ends,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        payload["tokenized_length"] = torch.tensor(
+            tokenized_lengths,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return payload
 
     def parameters(self, recurse: bool = True):
-        """Return only trainable (LoRA) parameters for the optimizer."""
-        return (p for p in self.model.parameters() if p.requires_grad)
+        for parameter in self.model.parameters(recurse=recurse):
+            if parameter.requires_grad:
+                yield parameter
 
     def save(self, path: str) -> None:
-        """Save LoRA adapter weights to path."""
-        self.model.save_pretrained(path)
-        logger.info("Policy LoRA adapter saved to %s", path)
-
-    def load(self, path: str) -> None:
-        """Load LoRA adapter weights from path."""
-        self.model.load_adapter(path, adapter_name="default")
-        logger.info("Policy LoRA adapter loaded from %s", path)
-
-# """
-# Policy model: a thin PyTorch wrapper around a HuggingFace causal language
-# model used as the Prompt Rewriter.
-
-# In training, both the token log-probabilities and the last-layer hidden
-# state (needed by the value head) are exposed.
-# """
-
-# import logging
-# from typing import Optional, Tuple
-
-# import torch
-# import torch.nn as nn
-# from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-
-# logger = logging.getLogger(__name__)
-
-
-# class PolicyModel(nn.Module):
-#     """
-#     Wraps a HuggingFace causal language model.
-
-#     Args:
-#         model_name: HuggingFace model identifier (default: 'gpt2').
-#         device: Torch device to move the model to.
-#     """
-
-#     def __init__(self, model_name: str = "gpt2", device: Optional[str] = None) -> None:
-#         super().__init__()
-#         self.device = torch.device(
-#             device or ("cuda" if torch.cuda.is_available() else "cpu")
-#         )
-#         logger.info("Loading policy model: %s on %s", model_name, self.device)
-
-#         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-#         if self.tokenizer.pad_token is None:
-#             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-#         self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-#             model_name, output_hidden_states=True
-#         )
-#         self.model.to(self.device)
-
-#     def forward(
-#         self,
-#         input_ids: torch.Tensor,
-#         attention_mask: Optional[torch.Tensor] = None,
-#     ) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         Forward pass.
-
-#         Returns:
-#             log_probs: per-token log-probabilities, shape (B, T).
-#             hidden_states: last hidden layer, shape (B, T, H).
-#         """
-#         outputs = self.model(
-#             input_ids=input_ids,
-#             attention_mask=attention_mask,
-#             labels=input_ids,
-#         )
-#         logits = outputs.logits  # (B, T, V)
-#         log_probs = torch.log_softmax(logits, dim=-1)
-
-#         # Gather log-prob of each actual token
-#         # Shift so that position i predicts token i+1
-#         shift_log_probs = log_probs[:, :-1, :]  # (B, T-1, V)
-#         shift_labels = input_ids[:, 1:]  # (B, T-1)
-#         token_log_probs = torch.gather(
-#             shift_log_probs, dim=2, index=shift_labels.unsqueeze(-1)
-#         ).squeeze(
-#             -1
-#         )  # (B, T-1)
-
-#         last_hidden = outputs.hidden_states[-1]  # (B, T, H)
-#         return token_log_probs, last_hidden
-
-#     def get_sequence_log_prob(
-#         self,
-#         input_ids: torch.Tensor,
-#         attention_mask: Optional[torch.Tensor] = None,
-#     ) -> torch.Tensor:
-#         """
-#         Sum log-probabilities over the sequence to get a scalar per sample.
-
-#         Returns:
-#             Tensor of shape (B,).
-#         """
-#         token_lp, _ = self.forward(input_ids, attention_mask)
-#         return token_lp.sum(dim=-1)
-
-#     def tokenize(self, texts: list[str]) -> dict:
-#         """Tokenise a list of strings and move to device."""
-#         encoded = self.tokenizer(
-#             texts,
-#             return_tensors="pt",
-#             padding=True,
-#             truncation=True,
-#             max_length=512,
-#         )
-#         return {k: v.to(self.device) for k, v in encoded.items()}
-
-#     def save(self, path: str) -> None:
-#         """Save model weights to *path*."""
-#         torch.save(self.model.state_dict(), path)
-#         logger.info("Policy model saved to %s", path)
-
-#     def load(self, path: str) -> None:
-#         """Load model weights from *path*."""
-#         state_dict = torch.load(path, map_location=self.device)
-#         self.model.load_state_dict(state_dict)
-#         logger.info("Policy model loaded from %s", path)
+        Path(path).mkdir(parents=True, exist_ok=True)
+        self.model.model.save_pretrained(path)

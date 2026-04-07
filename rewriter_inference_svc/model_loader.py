@@ -1,22 +1,14 @@
-"""Model loader for the rewriter inference service.
- 
-FIXES APPLIED:
-    - Added 4-bit NF4 quantization via BitsAndBytesConfig (was unquantized)
-    - Added LoRA adapter attachment via PEFT get_peft_model()
-    - Added explicit ValueHead nn.Linear layer
-    - Checkpoint fallback now loads from HuggingFace when both
-      rl_checkpoints/ and sft_checkpoints/ are empty (removes hard crash
-      on first run without SFT)
-    - enable_input_require_grads() called for gradient checkpointing compat
-"""
- 
 from __future__ import annotations
- 
+
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
- 
+
+import json
 import torch
 import torch.nn as nn
+from peft import PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -24,193 +16,268 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
-from peft import LoraConfig, get_peft_model, PeftModel
- 
-from config import (
-    BNB_4BIT_COMPUTE_DTYPE,
-    BNB_4BIT_QUANT_TYPE,
-    LOAD_IN_4BIT,
-    LORA_ALPHA,
-    LORA_DROPOUT,
-    LORA_R,
-    LORA_TARGET_MODULES,
+
+from rewriter_inference_svc.config import (
     MODEL_NAME,
     RL_CHECKPOINT_PATH,
-    SFT_CHECKPOINT_PATH,
     VALUE_HEAD_HIDDEN_SIZE,
 )
-from logger import get_logger
- 
+from rewriter_inference_svc.logger import get_logger
+
 log = get_logger(__name__)
- 
-# Module-level cache
-_cached_model:      Optional[PreTrainedModel]          = None
-_cached_tokenizer:  Optional[PreTrainedTokenizerBase]  = None
-_cached_value_head: Optional[nn.Linear]                = None
- 
- 
-# ---------------------------------------------------------------------------
-# Value head
-# ---------------------------------------------------------------------------
- 
-def _build_value_head(device: torch.device) -> nn.Linear:
-    """Create a single linear value head: hidden_size → 1."""
-    head = nn.Linear(VALUE_HEAD_HIDDEN_SIZE, 1, bias=False)
-    nn.init.normal_(head.weight, mean=0.0, std=0.01)
-    return head.to(torch.bfloat16).to(device)
- 
- 
-# ---------------------------------------------------------------------------
-# Checkpoint resolution
-# ---------------------------------------------------------------------------
- 
-def _resolve_checkpoint_path() -> Optional[Path]:
-    """Return the latest RL checkpoint path, or None to load from HuggingFace.
- 
-    Logic (SFT removed):
-        1. If rl_checkpoints/ has sub-directories → return latest by mtime.
-        2. Otherwise → return None (caller will load from HuggingFace).
- 
-    Returns:
-        Path to checkpoint directory, or None.
-    """
-    rl_path = Path(RL_CHECKPOINT_PATH)
- 
-    if rl_path.exists():
-        rl_checkpoints = [p for p in rl_path.iterdir() if p.is_dir()]
-        if rl_checkpoints:
-            latest = max(rl_checkpoints, key=lambda p: p.stat().st_mtime)
-            log.info("checkpoint_selected | source=rl_checkpoints | path=%s", latest)
-            return latest
- 
-    # No RL checkpoint found — signal caller to load from HuggingFace
-    log.info(
-        "checkpoint_selected | source=huggingface | model=%s "
-        "(no rl_checkpoints found)", MODEL_NAME
-    )
-    return None
- 
- 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
- 
-def load_model(
-    checkpoint_path: Optional[Path] = None,
-) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Linear]:
-    """Load the prompt-rewriter model, tokenizer, and value head.
- 
-    Loading strategy (SFT removed):
-        - If rl_checkpoints/ contains checkpoints → load latest LoRA adapter.
-        - Otherwise → load base Phi-3 from HuggingFace and attach fresh LoRA.
- 
-    All weights are 4-bit NF4 quantized to fit on a single GPU alongside
-    the frozen Med42-8B model.
- 
-    Returns:
-        Tuple of (model_with_lora, tokenizer, value_head).
-    """
+
+_cached_model: Optional[PreTrainedModel] = None
+_cached_tokenizer: Optional[PreTrainedTokenizerBase] = None
+_cached_value_head: Optional[nn.Module] = None
+
+_VALUE_HEAD_MIGRATION_MARKER = ".value_head_migration_v2.json"
+
+
+class ValueHead(nn.Module):
+    """Mirror RL loop value-head architecture for checkpoint compatibility."""
+
+    def __init__(self, hidden_size: int = VALUE_HEAD_HIDDEN_SIZE, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        param_dtype = next(self.layers.parameters()).dtype
+        if hidden_states.dtype != param_dtype:
+            hidden_states = hidden_states.to(param_dtype)
+        return self.layers(hidden_states)
+
+
+def _find_latest_checkpoint_dir() -> Optional[Path]:
+    root = Path(RL_CHECKPOINT_PATH)
+    if not root.exists():
+        return None
+
+    checkpoint_dirs: list[tuple[int, Path]] = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        match = re.fullmatch(r"checkpoint_(\d+)", entry.name)
+        if match:
+            checkpoint_dirs.append((int(match.group(1)), entry))
+
+    if not checkpoint_dirs:
+        return None
+    return max(checkpoint_dirs, key=lambda pair: pair[0])[1]
+
+
+def _latest_checkpoint_state_keys() -> set[str]:
+    return set(ValueHead(hidden_size=VALUE_HEAD_HIDDEN_SIZE, dropout=0.1).state_dict().keys())
+
+
+def _normalize_value_head_state_dict(raw_state: object, source_path: Path) -> dict[str, torch.Tensor]:
+    if not isinstance(raw_state, dict):
+        raise RuntimeError(
+            f"Unsupported value_head checkpoint format at {source_path}: {type(raw_state)}"
+        )
+
+    # Legacy single-linear checkpoints are not safely migratable to the MLP head.
+    if set(raw_state.keys()) == {"weight"}:
+        raise RuntimeError(
+            "Found legacy single-linear value_head checkpoint at "
+            f"{source_path}; remove this checkpoint or regenerate it with the current RL loop."
+        )
+
+    normalized: dict[str, torch.Tensor] = {}
+    for key, value in raw_state.items():
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"Invalid non-tensor value for key '{key}' in {source_path}")
+        canonical_key = key[7:] if key.startswith("module.") else key
+        normalized[canonical_key] = value
+
+    expected_keys = _latest_checkpoint_state_keys()
+    if set(normalized.keys()) != expected_keys:
+        raise RuntimeError(
+            "Incompatible value_head state keys in "
+            f"{source_path}; expected {sorted(expected_keys)} but got {sorted(normalized.keys())}"
+        )
+
+    return normalized
+
+
+def _migrate_value_head_checkpoints_once() -> None:
+    root = Path(RL_CHECKPOINT_PATH)
+    if not root.exists():
+        return
+
+    marker_path = root / _VALUE_HEAD_MIGRATION_MARKER
+    if marker_path.exists():
+        return
+
+    migrated = 0
+    checked = 0
+
+    for checkpoint_dir in sorted(root.glob("checkpoint_*")):
+        if not checkpoint_dir.is_dir():
+            continue
+
+        value_head_path = checkpoint_dir / "value_head.pt"
+        if not value_head_path.exists():
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_dir} is missing value_head.pt; refusing to start with inconsistent checkpoint state"
+            )
+
+        checked += 1
+        raw_state = torch.load(value_head_path, map_location="cpu")
+        normalized = _normalize_value_head_state_dict(raw_state, value_head_path)
+
+        if isinstance(raw_state, dict) and set(raw_state.keys()) != set(normalized.keys()):
+            torch.save(normalized, value_head_path)
+            migrated += 1
+
+    marker_payload = {
+        "migrated_checkpoints": migrated,
+        "checked_checkpoints": checked,
+        "version": 2,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+
+
+def _build_value_head(device: torch.device, checkpoint_dir: Optional[Path]) -> nn.Module:
+    value_head = ValueHead(hidden_size=VALUE_HEAD_HIDDEN_SIZE, dropout=0.1)
+    value_head = value_head.to(dtype=torch.float16, device=device)
+
+    if checkpoint_dir is not None:
+        value_head_path = checkpoint_dir / "value_head.pt"
+        if not value_head_path.exists():
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_dir} missing value_head.pt; fail-fast enabled to prevent silent random init"
+            )
+
+        state = torch.load(value_head_path, map_location="cpu")
+        normalized = _normalize_value_head_state_dict(state, value_head_path)
+        value_head.load_state_dict(normalized, strict=True)
+    else:
+        for module in value_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    value_head.eval()
+
+    return value_head
+
+
+def load_model() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Module]:
     global _cached_model, _cached_tokenizer, _cached_value_head
- 
+
     if (
         _cached_model is not None
         and _cached_tokenizer is not None
         and _cached_value_head is not None
     ):
         return _cached_model, _cached_tokenizer, _cached_value_head
- 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
- 
-    # ── 4-bit quantization config ─────────────────────────────────────────
-    compute_dtype = (
-        torch.bfloat16
-        if BNB_4BIT_COMPUTE_DTYPE == "bfloat16"
-        else torch.float16
-    )
+
+    _migrate_value_head_checkpoints_once()
+
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=LOAD_IN_4BIT,
-        bnb_4bit_quant_type=BNB_4BIT_QUANT_TYPE,
-        bnb_4bit_compute_dtype=compute_dtype,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
-    ) if LOAD_IN_4BIT else None
- 
-    # ── Tokenizer ─────────────────────────────────────────────────────────
-    resolved = checkpoint_path or _resolve_checkpoint_path()
- 
-    # For tokenizer: prefer checkpoint, fall back to base model name
-    tok_source = str(resolved) if resolved else MODEL_NAME
-    tokenizer = AutoTokenizer.from_pretrained(tok_source, trust_remote_code=True)
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    log.info("tokenizer_loaded | source=%s", tok_source)
- 
-    # ── Base model ────────────────────────────────────────────────────────
-    load_kwargs = dict(
-        trust_remote_code=True,
-        torch_dtype=compute_dtype,
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
         device_map="auto",
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
     )
-    if bnb_config:
-        load_kwargs["quantization_config"] = bnb_config
- 
-    base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
-    base_model.config.use_cache = False
-    log.info("base_model_loaded | model=%s | 4bit=%s", MODEL_NAME, LOAD_IN_4BIT)
- 
-    # ── LoRA adapter ──────────────────────────────────────────────────────
-    if resolved and (resolved / "adapter_config.json").exists():
-        # Load existing RL LoRA weights from checkpoint
-        model = PeftModel.from_pretrained(base_model, str(resolved))
-        log.info("lora_loaded | source=%s", resolved)
-    else:
-        # Attach fresh LoRA adapter (first run, no prior RL checkpoint)
-        peft_config = LoraConfig(
-            r=LORA_R,
-            lora_alpha=LORA_ALPHA,
-            target_modules=LORA_TARGET_MODULES,
-            lora_dropout=LORA_DROPOUT,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(base_model, peft_config)
-        log.info("lora_created | r=%d | alpha=%d", LORA_R, LORA_ALPHA)
- 
-    # Required for gradient checkpointing with 4-bit quantized models
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    model.eval()
-    log.info("model_loaded | device=%s", device)
- 
-    # ── Value head ────────────────────────────────────────────────────────
-    value_head = _build_value_head(device)
- 
-    # Load value head weights from checkpoint if available
-    if resolved:
-        vh_path = resolved / "value_head.pt"
-        if vh_path.exists():
-            state = torch.load(str(vh_path), map_location=device)
-            value_head.load_state_dict(state)
-            log.info("value_head_loaded | source=%s", vh_path)
+    base_model.config.use_cache = True
+
+    checkpoint_dir = _find_latest_checkpoint_dir()
+    lora_adapter_path = None
+    if checkpoint_dir is not None:
+        candidate = checkpoint_dir / "lora_adapter"
+        if candidate.exists():
+            lora_adapter_path = candidate
+
+    model: PreTrainedModel = base_model
+    lora_active = False
+    if lora_adapter_path is not None:
+        adapter_config = lora_adapter_path / "adapter_config.json"
+        if adapter_config.exists():
+            try:
+                model = PeftModel.from_pretrained(
+                    base_model,
+                    str(lora_adapter_path),
+                    is_trainable=False,
+                )
+                lora_active = True
+                log.info("Loaded LoRA adapter from %s", lora_adapter_path)
+            except Exception as exc:
+                log.exception(
+                    "Failed to load LoRA adapter from %s; continuing with base model only | error=%s",
+                    lora_adapter_path,
+                    exc,
+                )
+                model = base_model
+                lora_active = False
         else:
-            log.info("value_head_initialised_fresh | no checkpoint found")
+            log.warning(
+                "LoRA adapter directory missing adapter_config.json at %s; continuing with base model only",
+                lora_adapter_path,
+            )
     else:
-        log.info("value_head_initialised_fresh | first run")
- 
-    _cached_model      = model
-    _cached_tokenizer  = tokenizer
+        log.info("No RL LoRA adapter checkpoint found; using base model only")
+
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception as exc:
+            log.warning("Unable to disable gradient checkpointing: %s", exc)
+    if hasattr(model, "disable_input_require_grads"):
+        try:
+            model.disable_input_require_grads()
+        except Exception as exc:
+            log.warning("Unable to disable input gradients: %s", exc)
+
+    model.eval()
+
+    device = next(model.parameters()).device
+    value_head = _build_value_head(device, checkpoint_dir)
+
+    log.info("Inference model ready | lora_active=%s", lora_active)
+
+    _cached_model = model
+    _cached_tokenizer = tokenizer
     _cached_value_head = value_head
- 
     return model, tokenizer, value_head
- 
- 
+
+
 def clear_cache() -> None:
-    """Clear the cached model, tokenizer, and value head (useful for testing)."""
     global _cached_model, _cached_tokenizer, _cached_value_head
-    _cached_model      = None
-    _cached_tokenizer  = None
+
+    _cached_model = None
+    _cached_tokenizer = None
     _cached_value_head = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def reload_from_latest_checkpoint() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Module]:
+    clear_cache()
+    return load_model()
+
+
+def get_cached_model() -> Optional[PreTrainedModel]:
+    return _cached_model
  
 
 # """Model loader for the rewriter inference service.

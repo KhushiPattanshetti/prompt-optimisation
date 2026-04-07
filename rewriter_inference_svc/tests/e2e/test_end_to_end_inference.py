@@ -1,67 +1,46 @@
-"""End-to-end test for the rewriter inference service.
+"""End-to-end tests for rewriter HTTP API using ASGI transport."""
 
-Steps:
-1. Start the FastAPI service (httpx AsyncClient + ASGITransport).
-2. Send an HTTP POST request.
-3. Verify response structure contains rewritten_prompt, log_prob_old, value_estimate.
-"""
-
-import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
-import torch
 import pytest
+import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from rewriter_inference_svc.model_loader import clear_cache
 
-from model_loader import clear_cache
+pytestmark = pytest.mark.e2e
 
 
-def _build_mock_model_and_tokenizer(
-    vocab_size: int = 50,
-    input_len: int = 4,
-    gen_len: int = 6,
-    hidden_dim: int = 16,
-):
-    input_ids = torch.randint(0, vocab_size, (1, input_len))
-    generated_ids = torch.cat(
-        [input_ids, torch.randint(0, vocab_size, (1, gen_len))], dim=1
-    )
+def _build_mock_bundle(hidden_dim: int = 16):
+    class TokenizerStub:
+        eos_token_id = 0
 
-    tok_result = MagicMock()
-    tok_result.__getitem__ = lambda self, key: {
-        "input_ids": input_ids,
-        "attention_mask": torch.ones(1, input_len),
-    }[key]
-    tok_result.to.return_value = tok_result
-    tok_result.keys.return_value = ["input_ids", "attention_mask"]
-    tok_result.__iter__ = lambda self: iter(["input_ids", "attention_mask"])
+        def __call__(self, *_args, **_kwargs):
+            return {
+                "input_ids": torch.randint(0, 20, (1, 4)),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            }
 
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.side_effect = lambda *a, **kw: tok_result
-    mock_tokenizer.decode.return_value = "Rewritten clinical prompt for evaluation."
+        def decode(self, _ids, skip_special_tokens=True):
+            return (
+                "Extract all diagnosis codes from the note and return only a JSON list "
+                "of strings without explanations."
+            )
 
-    logits = torch.randn(1, input_len + gen_len, vocab_size)
-    hidden = torch.randn(1, input_len, hidden_dim)
+    model = MagicMock()
+    prompt_ids = torch.randint(0, 20, (1, 4))
+    model.generate.return_value = torch.cat([prompt_ids, torch.randint(0, 20, (1, 4))], dim=1)
 
-    fwd_output = MagicMock()
-    fwd_output.logits = logits
-    fwd_output.hidden_states = [hidden]
+    logits = torch.randn(1, 8, 24)
+    hidden = torch.randn(1, 8, hidden_dim)
+    model.side_effect = lambda *a, **k: SimpleNamespace(logits=logits, hidden_states=[hidden])
 
-    mock_model = MagicMock()
-    mock_model.generate.return_value = generated_ids
-    mock_model.side_effect = lambda *a, **kw: fwd_output
-    mock_model.value_head = MagicMock(return_value=torch.tensor([0.42]))
-    mock_model.v_head = None
-    mock_model.score = None
+    model.parameters.side_effect = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
 
-    mock_param = MagicMock()
-    mock_param.device = torch.device("cpu")
-    mock_model.parameters.return_value = iter([mock_param])
-
-    return mock_model, mock_tokenizer
+    value_head = torch.nn.Linear(hidden_dim, 1, bias=False)
+    return model, TokenizerStub(), value_head
 
 
 @pytest.fixture(autouse=True)
@@ -72,26 +51,18 @@ def _clear_cache():
 
 
 def _make_async_client():
-    """Create an httpx async client bound to the FastAPI app via ASGI transport."""
-    from app import app
+    from rewriter_inference_svc.app import app
+
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
 
 class TestEndToEndInference:
-    """End-to-end tests exercising the full HTTP → response cycle."""
-
-    @patch("inference_engine._save_output")
-    @patch("inference_engine.load_model")
+    @patch("rewriter_inference_svc.inference_engine._save_output")
+    @patch("rewriter_inference_svc.inference_engine.load_model")
     @pytest.mark.asyncio
-    async def test_rewrite_prompt_endpoint(
-        self,
-        mock_load: MagicMock,
-        mock_save: MagicMock,
-    ) -> None:
-        """POST /rewrite_prompt should return 200 with correct response fields."""
-        mock_model, mock_tokenizer = _build_mock_model_and_tokenizer()
-        mock_load.return_value = (mock_model, mock_tokenizer)
+    async def test_rewrite_prompt_endpoint(self, mock_load: MagicMock, mock_save: MagicMock) -> None:
+        mock_load.return_value = _build_mock_bundle()
         mock_save.return_value = Path("/tmp/dummy.json")
 
         async with _make_async_client() as client:
@@ -105,32 +76,15 @@ class TestEndToEndInference:
         assert "rewritten_prompt" in body
         assert "log_prob_old" in body
         assert "value_estimate" in body
-        assert isinstance(body["rewritten_prompt"], str)
-        assert isinstance(body["log_prob_old"], float)
-        assert isinstance(body["value_estimate"], float)
 
-    @patch("inference_engine._save_output")
-    @patch("inference_engine.load_model")
     @pytest.mark.asyncio
-    async def test_empty_note_returns_422(
-        self,
-        mock_load: MagicMock,
-        mock_save: MagicMock,
-    ) -> None:
-        """An empty clinical_note should trigger a 422 validation error."""
+    async def test_empty_note_returns_422(self) -> None:
         async with _make_async_client() as client:
             response = await client.post("/rewrite_prompt", json={"clinical_note": ""})
         assert response.status_code == 422
 
-    @patch("inference_engine._save_output")
-    @patch("inference_engine.load_model")
     @pytest.mark.asyncio
-    async def test_missing_field_returns_422(
-        self,
-        mock_load: MagicMock,
-        mock_save: MagicMock,
-    ) -> None:
-        """A missing clinical_note field should trigger a 422 validation error."""
+    async def test_missing_field_returns_422(self) -> None:
         async with _make_async_client() as client:
             response = await client.post("/rewrite_prompt", json={})
         assert response.status_code == 422

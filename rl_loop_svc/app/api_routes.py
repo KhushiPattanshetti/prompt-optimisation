@@ -1,167 +1,235 @@
-"""
-Value head: MLP mapping pooled hidden state → scalar V(s).
+import json
+import logging
+import re
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
-FIX SUMMARY (from review):
-  - Default hidden_size was 768 (GPT-2).
-    Phi-3-mini hidden size is 3072.
-    ValueHead(768→1) would throw a shape mismatch when fed
-    Phi-3 hidden states of shape (B, T, 3072).
-  - Default changed to 3072. Settings.hidden_size also fixed to 3072.
-"""
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from pydantic import BaseModel, Field
 
-import torch
-import torch.nn as nn
+from rl.lifecycle_manager import TrainerState
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_training_loop = None
+_rollouts_dir: Optional[Path] = None
+_seen_rollout_ids: set[str] = set()
+_seen_rollout_ids_index: Optional[Path] = None
+_rollout_lock = threading.Lock()
 
 
-class ValueHead(nn.Module):
-    """
-    Two-layer MLP value head.
+def set_training_loop(loop, rollouts_dir: Path) -> None:
+    global _training_loop, _rollouts_dir, _seen_rollout_ids, _seen_rollout_ids_index
+    _training_loop = loop
+    _rollouts_dir = rollouts_dir
+    _seen_rollout_ids_index = _rollouts_dir / ".seen_rollout_ids"
+    _seen_rollout_ids = _load_seen_rollout_ids()
 
-    Args:
-        hidden_size: Dimensionality of the input hidden state.
-                     Must match the policy model hidden size.
-                     Phi-3-mini = 3072.
-        dropout:     Dropout probability applied between layers.
-    """
 
-    def __init__(self, hidden_size: int = 3072, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
+class StatusResponse(BaseModel):
+    trainer_state: str
+    rollouts_loaded: int
+    training_step: int
+    last_loss: float
+    kl_divergence: float
+    last_train_success: Optional[bool] = None
+    last_train_error: Optional[str] = None
+    last_train_started_at: Optional[str] = None
+    last_train_finished_at: Optional[str] = None
+
+
+class TrainResponse(BaseModel):
+    triggered: bool
+    message: str
+
+
+class CheckpointResponse(BaseModel):
+    available: bool
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class RolloutSubmission(BaseModel):
+    rollout_id: Optional[str] = None
+    run_id: Optional[str] = None
+    group_id: Optional[str] = None
+    original_prompt: str
+    rewritten_prompt: str
+    reward: float = Field(..., ge=-1.0, le=1.0)
+    concept_reward: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
+    sample_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    log_prob_old: float
+    value_estimate: Optional[float] = None
+
+
+class RolloutBatchSubmission(BaseModel):
+    run_id: Optional[str] = None
+    rollouts: List[RolloutSubmission] = Field(..., min_length=1)
+
+
+class RolloutAck(BaseModel):
+    accepted: bool
+    file_path: str
+    accepted_count: int = 0
+    duplicate_count: int = 0
+    run_id: Optional[str] = None
+
+
+def _load_seen_rollout_ids() -> set[str]:
+    if _seen_rollout_ids_index is None or not _seen_rollout_ids_index.exists():
+        return set()
+
+    try:
+        lines = _seen_rollout_ids_index.read_text(encoding="utf-8").splitlines()
+        return {line.strip() for line in lines if line.strip()}
+    except Exception:
+        return set()
+
+
+def _persist_seen_rollout_ids() -> None:
+    if _seen_rollout_ids_index is None:
+        return
+    _seen_rollout_ids_index.write_text(
+        "\n".join(sorted(_seen_rollout_ids)),
+        encoding="utf-8",
+    )
+
+
+def _sanitize_run_id(run_id: Optional[str]) -> str:
+    candidate = str(run_id or "default").strip()
+    if not candidate:
+        candidate = "default"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", candidate)
+
+
+def _persist_rollout_batch(submissions: List[RolloutSubmission], run_id: Optional[str]) -> RolloutAck:
+    if _rollouts_dir is None:
+        raise HTTPException(status_code=503, detail="Rollout directory not configured")
+
+    _rollouts_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_run_id = _sanitize_run_id(run_id or submissions[0].run_id)
+    accepted_rollouts: List[Dict[str, Any]] = []
+    duplicate_count = 0
+
+    with _rollout_lock:
+        for submission in submissions:
+            rollout_id = (submission.rollout_id or "").strip()
+            if rollout_id:
+                if rollout_id in _seen_rollout_ids:
+                    duplicate_count += 1
+                    continue
+                _seen_rollout_ids.add(rollout_id)
+
+            row = submission.model_dump(exclude_none=True)
+            row["run_id"] = resolved_run_id
+            accepted_rollouts.append(row)
+
+        if accepted_rollouts:
+            _persist_seen_rollout_ids()
+
+    if not accepted_rollouts:
+        return RolloutAck(
+            accepted=True,
+            file_path="",
+            accepted_count=0,
+            duplicate_count=duplicate_count,
+            run_id=resolved_run_id,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: Tensor of shape (B, T, H).
+    payload = {
+        "run_id": resolved_run_id,
+        "rollouts": accepted_rollouts,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "batch_id": uuid4().hex,
+    }
 
-        Returns:
-            values: Tensor of shape (B,) — mean-pooled value estimate.
-        """
-        pooled = hidden_states.mean(dim=1)      # (B, H)
-        return self.net(pooled).squeeze(-1)     # (B,)
+    segment_path = _rollouts_dir / f"rollout_segment_{resolved_run_id}.jsonl"
+    with segment_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
-    def save(self, path: str) -> None:
-        torch.save(self.state_dict(), path)
-
-    def load(self, path: str, device: str = "cpu") -> None:
-        self.load_state_dict(torch.load(path, map_location=device))
-
-# """
-# FastAPI route definitions for the RL training microservice.
-
-# Endpoints:
-#     GET  /status      → current training state + metrics
-#     POST /train       → manually trigger one training cycle
-#     GET  /checkpoint  → latest checkpoint metadata
-# """
-
-# import logging
-# from typing import Any, Dict, Optional
-
-# from fastapi import APIRouter, BackgroundTasks, HTTPException
-# from pydantic import BaseModel
-
-# logger = logging.getLogger(__name__)
-
-# router = APIRouter()
-
-# # The TrainingLoop instance is injected at app startup (set by main.py)
-# _training_loop = None  # type: ignore
+    return RolloutAck(
+        accepted=True,
+        file_path=str(segment_path),
+        accepted_count=len(accepted_rollouts),
+        duplicate_count=duplicate_count,
+        run_id=resolved_run_id,
+    )
 
 
-# def set_training_loop(loop: Any) -> None:  # pragma: no cover
-#     global _training_loop
-#     _training_loop = loop
+def _background_train() -> None:
+    if _training_loop is None:
+        return
+    _training_loop.last_train_started_at = datetime.now(timezone.utc).isoformat()
+    _training_loop.last_train_finished_at = None
+    _training_loop.last_train_success = None
+    _training_loop.last_train_error = None
+    try:
+        _training_loop.run_once()
+        _training_loop.last_train_success = True
+        _training_loop.last_train_error = None
+    except Exception as exc:
+        _training_loop.last_train_success = False
+        _training_loop.last_train_error = str(exc)
+        logger.error("Background training failed: %s", exc, exc_info=True)
+        _training_loop.lifecycle.reset()
+    finally:
+        _training_loop.last_train_finished_at = datetime.now(timezone.utc).isoformat()
 
 
-# # ── Response schemas ──────────────────────────────────────────────────────────
+@router.get("/status", response_model=StatusResponse)
+def get_status() -> StatusResponse:
+    if _training_loop is None:
+        raise HTTPException(status_code=503, detail="Training loop not initialised")
+
+    return StatusResponse(
+        trainer_state=_training_loop.lifecycle.state.value,
+        rollouts_loaded=_training_loop.rollouts_loaded,
+        training_step=_training_loop.training_step,
+        last_loss=_training_loop.last_loss,
+        kl_divergence=_training_loop.kl_controller.last_kl,
+        last_train_success=_training_loop.last_train_success,
+        last_train_error=_training_loop.last_train_error,
+        last_train_started_at=_training_loop.last_train_started_at,
+        last_train_finished_at=_training_loop.last_train_finished_at,
+    )
 
 
-# class StatusResponse(BaseModel):
-#     trainer_state: str
-#     rollouts_loaded: int
-#     training_step: int
-#     last_loss: float
-#     kl_divergence: float
+@router.post("/train", response_model=TrainResponse)
+def trigger_train(background_tasks: BackgroundTasks) -> TrainResponse:
+    if _training_loop is None:
+        raise HTTPException(status_code=503, detail="Training loop not initialised")
+
+    if _training_loop.lifecycle.state != TrainerState.IDLE:
+        return TrainResponse(
+            triggered=False,
+            message=f"Trainer is busy: {_training_loop.lifecycle.state.value}",
+        )
+
+    background_tasks.add_task(_background_train)
+    return TrainResponse(triggered=True, message="Training cycle started in background")
 
 
-# class TrainResponse(BaseModel):
-#     triggered: bool
-#     message: str
+@router.get("/checkpoint", response_model=CheckpointResponse)
+def get_checkpoint() -> CheckpointResponse:
+    if _training_loop is None:
+        raise HTTPException(status_code=503, detail="Training loop not initialised")
+
+    meta = _training_loop.checkpoint_manager.load_latest_meta()
+    if meta is None:
+        return CheckpointResponse(available=False)
+    return CheckpointResponse(available=True, metadata=meta)
 
 
-# class CheckpointResponse(BaseModel):
-#     available: bool
-#     metadata: Optional[Dict[str, Any]] = None
+@router.post("/rollout", response_model=RolloutAck)
+def submit_rollout(submission: RolloutSubmission) -> RolloutAck:
+    return _persist_rollout_batch([submission], submission.run_id)
 
 
-# # ── Routes ─────────────────────────────────────────────────────────────────────
-
-
-# @router.get("/status", response_model=StatusResponse, summary="Current training status")
-# def get_status() -> StatusResponse:
-#     """Return current lifecycle state and live training metrics."""
-#     if _training_loop is None:
-#         raise HTTPException(status_code=503, detail="Training loop not initialised")
-
-#     return StatusResponse(
-#         trainer_state=_training_loop.lifecycle.state.value,
-#         rollouts_loaded=_training_loop.rollouts_loaded,
-#         training_step=_training_loop.training_step,
-#         last_loss=_training_loop.last_loss,
-#         kl_divergence=_training_loop.kl_controller.last_kl,
-#     )
-
-
-# def _background_train() -> None:
-#     """Run one RL cycle in a background thread."""
-#     if _training_loop is None:
-#         return
-#     try:
-#         _training_loop.run_once()
-#     except Exception as exc:
-#         logger.error("Background training failed: %s", exc, exc_info=True)
-#         _training_loop.lifecycle.reset()
-
-
-# @router.post(
-#     "/train", response_model=TrainResponse, summary="Trigger manual training cycle"
-# )
-# def trigger_train(background_tasks: BackgroundTasks) -> TrainResponse:
-#     """
-#     Manually kick off one collect → train → checkpoint cycle.
-#     Returns immediately; training runs in the background.
-#     """
-#     if _training_loop is None:
-#         raise HTTPException(status_code=503, detail="Training loop not initialised")
-
-#     from rl.lifecycle_manager import TrainerState
-
-#     if _training_loop.lifecycle.state != TrainerState.IDLE:
-#         return TrainResponse(
-#             triggered=False,
-#             message=f"Trainer is busy: {_training_loop.lifecycle.state.value}",
-#         )
-
-#     background_tasks.add_task(_background_train)
-#     return TrainResponse(triggered=True, message="Training cycle started in background")
-
-
-# @router.get(
-#     "/checkpoint",
-#     response_model=CheckpointResponse,
-#     summary="Latest checkpoint metadata",
-# )
-# def get_checkpoint() -> CheckpointResponse:
-#     """Return metadata of the most recently saved checkpoint."""
-#     if _training_loop is None:
-#         raise HTTPException(status_code=503, detail="Training loop not initialised")
-
-#     meta = _training_loop.checkpoint_manager.load_latest_meta()
-#     if meta is None:
-#         return CheckpointResponse(available=False)
-#     return CheckpointResponse(available=True, metadata=meta)
+@router.post("/rollout_batch", response_model=RolloutAck)
+def submit_rollout_batch(submission: RolloutBatchSubmission) -> RolloutAck:
+    return _persist_rollout_batch(submission.rollouts, submission.run_id)

@@ -17,7 +17,6 @@ import torch
 
 from rl.advantage import compute_gae
 from rl.rollout_buffer import RolloutBuffer
-from schemas.rollout_schema import RolloutEntry, RolloutFile
 from storage.rollout_loader import RolloutLoader
 
 
@@ -27,10 +26,13 @@ class TestRolloutLoaderBufferIntegration:
         entries = loader.load_all()
         buf = RolloutBuffer()
         for e in entries:
+            value_estimate = float(e.value_estimate) if e.value_estimate is not None else 0.0
             buf.store(
                 e.reward,
+                e.concept_reward if e.concept_reward is not None else e.reward,
                 e.log_prob_old,
-                e.value_estimate,
+                value_estimate,
+                e.group_id or "g_default",
                 e.original_prompt,
                 e.rewritten_prompt,
             )
@@ -55,11 +57,11 @@ class TestRolloutLoaderBufferIntegration:
             "log_prob_old": -5.0,
             "value_estimate": 0.3,
         }
-        (d / "batch_001.json").write_text(json.dumps({"rollouts": [entry]}))
+        (d / "rollout_batch_001.json").write_text(json.dumps({"rollouts": [entry]}))
         first = loader.load_new()
         assert len(first) == 1
 
-        (d / "batch_002.json").write_text(json.dumps({"rollouts": [entry, entry]}))
+        (d / "rollout_batch_002.json").write_text(json.dumps({"rollouts": [entry, entry]}))
         second = loader.load_new()
         assert len(second) == 2
 
@@ -67,7 +69,9 @@ class TestRolloutLoaderBufferIntegration:
         loader = RolloutLoader(rollouts_dir)
         entries = loader.load_all()
         rewards = torch.tensor([e.reward for e in entries])
-        values = torch.tensor([e.value_estimate for e in entries])
+        values = torch.tensor([
+            float(e.value_estimate) if e.value_estimate is not None else 0.0 for e in entries
+        ])
         adv = compute_gae(rewards, values)
         assert adv.shape == rewards.shape
         assert torch.isfinite(adv).all()
@@ -77,15 +81,20 @@ class TestRolloutLoaderBufferIntegration:
         entries = loader.load_all()
         buf = RolloutBuffer()
         for e in entries:
+            value_estimate = float(e.value_estimate) if e.value_estimate is not None else 0.0
             buf.store(
                 e.reward,
+                e.concept_reward if e.concept_reward is not None else e.reward,
                 e.log_prob_old,
-                e.value_estimate,
+                value_estimate,
+                e.group_id or "g_default",
                 e.original_prompt,
                 e.rewritten_prompt,
             )
         rewards = torch.tensor([e.reward for e in entries])
-        values = torch.tensor([e.value_estimate for e in entries])
+        values = torch.tensor([
+            float(e.value_estimate) if e.value_estimate is not None else 0.0 for e in entries
+        ])
         adv = compute_gae(rewards, values)
         batch = buf.build(adv)
         assert batch.rewards.shape[0] == len(entries)
@@ -94,7 +103,7 @@ class TestRolloutLoaderBufferIntegration:
     def test_malformed_file_skipped(self, tmp_path):
         d = tmp_path / "rollouts"
         d.mkdir()
-        (d / "bad.json").write_text("{invalid json}")
+        (d / "rollout_batch_bad.json").write_text("{invalid json}")
         loader = RolloutLoader(d)
         entries = loader.load_all()
         assert entries == []

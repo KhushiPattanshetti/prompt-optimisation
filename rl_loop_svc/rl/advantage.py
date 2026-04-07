@@ -46,5 +46,6 @@ def compute_gae(
     # Normalise to zero mean / unit variance for stability
     if normalize and T > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = torch.clamp(advantages, -5.0, 5.0)
 
     return advantages

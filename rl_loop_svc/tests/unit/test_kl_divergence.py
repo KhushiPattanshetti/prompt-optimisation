@@ -19,11 +19,11 @@ class TestKLController:
         kl = controller.compute_kl(lp_policy, lp_ref)
         assert (kl > 0).all()
 
-    def test_compute_kl_negative_when_policy_lower(self, controller):
+    def test_compute_kl_clamped_when_policy_lower(self, controller):
         lp_policy = torch.tensor([-5.0, -6.0])
         lp_ref = torch.tensor([-3.0, -4.0])
         kl = controller.compute_kl(lp_policy, lp_ref)
-        assert (kl < 0).all()
+        assert torch.allclose(kl, torch.zeros_like(kl))
 
     def test_compute_kl_zero_when_equal(self, controller):
         lp = torch.tensor([-3.0, -4.0])

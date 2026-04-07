@@ -1,18 +1,8 @@
-"""Unit tests for the Pydantic schemas.
-
-Tests:
-- Request validation
-- Response validation
-"""
-
-import sys
-from pathlib import Path
+"""Unit tests for rewriter request/response schemas."""
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from schemas import RewriteRequest, RewriteResponse
+from rewriter_inference_svc.schemas import RewriteRequest, RewriteResponse
 
 
 class TestRewriteRequest:
@@ -43,10 +33,12 @@ class TestRewriteResponse:
             rewritten_prompt="Rewritten text",
             log_prob_old=-10.23,
             value_estimate=0.41,
+            generation_source="model",
         )
         assert resp.rewritten_prompt == "Rewritten text"
         assert resp.log_prob_old == pytest.approx(-10.23)
         assert resp.value_estimate == pytest.approx(0.41)
+        assert resp.generation_source == "model"
 
     def test_missing_fields(self) -> None:
         """Missing required fields should raise a validation error."""
@@ -60,6 +52,7 @@ class TestRewriteResponse:
                 rewritten_prompt="text",
                 log_prob_old="not_a_number",  # type: ignore[arg-type]
                 value_estimate=0.5,
+                generation_source="model",
             )
 
     def test_response_serialisation(self) -> None:
@@ -68,6 +61,7 @@ class TestRewriteResponse:
             rewritten_prompt="Rewritten",
             log_prob_old=-5.0,
             value_estimate=0.2,
+            generation_source="model",
         )
         data = resp.model_dump()
-        assert set(data.keys()) == {"rewritten_prompt", "log_prob_old", "value_estimate"}
+        assert set(data.keys()) == {"rewritten_prompt", "log_prob_old", "value_estimate", "generation_source"}

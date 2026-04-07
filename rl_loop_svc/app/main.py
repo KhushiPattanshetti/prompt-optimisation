@@ -1,233 +1,217 @@
-"""
-FastAPI application entry point for the RL training microservice.
-
-Start with:
-    uvicorn app.main:app --host 0.0.0.0 --port 8004
-
-FIX SUMMARY (from review):
-  - set_training_loop() now also receives rollouts_dir so the
-    POST /rollout endpoint knows where to write incoming rollouts.
-  - Policy and reference models now use 4-bit quantization
-    (delegated to PolicyModel and ReferenceModel constructors).
-  - RL checkpoint loading wired into PolicyModel constructor.
-"""
-
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+import torch
 from fastapi import FastAPI
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api_routes import router, set_training_loop
 from app.config import settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-def _find_latest_rl_checkpoint() -> Path | None:
-    """Return the most recent checkpoint directory, or None."""
-    ckpt_dir = settings.checkpoints_dir
-    if not ckpt_dir.exists():
+def _use_distributed_training() -> bool:
+    return settings.distributed_enabled and settings.distributed_world_size > 1
+
+
+def _resolve_device_label(configured_index: int, role: str) -> str:
+    if not torch.cuda.is_available():
+        logger.info("%s_device_fallback_cpu | reason=no_cuda", role)
+        return "cpu"
+
+    available = torch.cuda.device_count()
+    if available <= 0:
+        logger.info("%s_device_fallback_cpu | reason=no_visible_cuda_devices", role)
+        return "cpu"
+
+    if configured_index < 0 or configured_index >= available:
+        logger.warning(
+            "%s_device_index_out_of_range | requested=%d | visible=%d | fallback=0",
+            role,
+            configured_index,
+            available,
+        )
+        return "cuda:0"
+
+    return f"cuda:{configured_index}"
+
+
+def _log_gpu_inventory() -> None:
+    if not torch.cuda.is_available():
+        logger.info("gpu_inventory | cuda_available=false")
+        return
+
+    count = torch.cuda.device_count()
+    logger.info("gpu_inventory | cuda_available=true | device_count=%d", count)
+    for idx in range(count):
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = props.total_memory / (1024 ** 3)
+        logger.info(
+            "gpu_device | index=%d | name=%s | total_mem_gb=%.2f",
+            idx,
+            props.name,
+            total_gb,
+        )
+
+
+def _find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
+    if not checkpoints_dir.exists():
         return None
-    subdirs = [
-        p for p in ckpt_dir.iterdir()
+
+    candidates = [
+        p for p in checkpoints_dir.iterdir()
         if p.is_dir() and p.name.startswith("checkpoint_")
     ]
-    if not subdirs:
+    if not candidates:
         return None
-    return max(subdirs, key=lambda p: p.name)
+    return max(candidates, key=lambda p: p.name)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Initialise all RL components at startup.
+async def lifespan(_: FastAPI):
+    startup_t0 = time.perf_counter()
+    logger.info(
+        "rl_startup_begin | model=%s | distributed=%s | world_size=%d",
+        settings.model_name,
+        _use_distributed_training(),
+        settings.distributed_world_size,
+    )
 
-    Loading order:
-        1. Ensure directories exist.
-        2. Resolve latest RL checkpoint (if any).
-        3. Load PolicyModel (4-bit + LoRA, from checkpoint or HuggingFace).
-        4. Load ReferenceModel (4-bit, frozen, always from HuggingFace).
-        5. Build ValueHead with correct hidden_size (3072 for Phi-3).
-        6. Wire up TrainingLoop and expose via API.
-    """
-    logger.info("Starting RL training microservice …")
+    try:
+        settings.rollouts_dir.mkdir(parents=True, exist_ok=True)
+        settings.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "startup_stage | stage=dirs_ready | rollouts_dir=%s | checkpoints_dir=%s",
+            settings.rollouts_dir,
+            settings.checkpoints_dir,
+        )
 
-    settings.rollouts_dir.mkdir(parents=True, exist_ok=True)
-    settings.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        if settings.startup_log_gpu_inventory:
+            _log_gpu_inventory()
 
-    from models.policy_model import PolicyModel
-    from models.reference_model import ReferenceModel
-    from models.value_head import ValueHead
-    from rl.training_loop import TrainingLoop
-    from storage.checkpoint_manager import CheckpointManager
-    from storage.rollout_loader import RolloutLoader
+        from rl.training_loop import TrainingLoop
+        from storage.checkpoint_manager import CheckpointManager
+        from storage.rollout_loader import RolloutLoader
 
-    # Resolve latest RL checkpoint for policy model
-    latest_ckpt = _find_latest_rl_checkpoint()
-    lora_path   = None
-    if latest_ckpt is not None:
-        lora_adapter = latest_ckpt / "lora_adapter"
-        if lora_adapter.exists():
-            lora_path = str(lora_adapter)
-            logger.info("Resuming from RL checkpoint: %s", latest_ckpt)
-        else:
+        stage_t0 = time.perf_counter()
+        latest_ckpt = _find_latest_checkpoint(settings.checkpoints_dir)
+        load_checkpoint_weights = not settings.ppo_debug_mode
+        checkpoint_path = None
+        if latest_ckpt is not None and load_checkpoint_weights:
+            lora_dir = latest_ckpt / "lora_adapter"
+            if lora_dir.exists():
+                checkpoint_path = str(lora_dir)
+        elif latest_ckpt is not None and not load_checkpoint_weights:
             logger.warning(
-                "Checkpoint dir found but no lora_adapter/ inside: %s",
+                "startup_debug_mode_checkpoint_load_skipped | checkpoint=%s",
                 latest_ckpt,
             )
+        logger.info(
+            "startup_stage | stage=checkpoint_scan_done | elapsed_s=%.2f | latest_ckpt=%s | lora_path=%s",
+            time.perf_counter() - stage_t0,
+            latest_ckpt,
+            checkpoint_path,
+        )
 
-    # Load policy model (4-bit + LoRA)
-    policy_model = PolicyModel(
-        model_name=settings.model_name,
-        checkpoint_path=lora_path,   # None → fresh LoRA on first run
-    )
+        stage_t0 = time.perf_counter()
+        rollout_loader = RolloutLoader(settings.rollouts_dir)
+        checkpoint_manager = CheckpointManager(
+            checkpoints_dir=settings.checkpoints_dir,
+            max_checkpoints=settings.max_checkpoints,
+        )
+        if _use_distributed_training():
+            training_loop = TrainingLoop(
+                rollout_loader=rollout_loader,
+                checkpoint_manager=checkpoint_manager,
+                policy_model=None,
+                reference_model=None,
+                value_head=None,
+            )
+            logger.info("startup_stage | stage=distributed_proxy_ready")
+            policy_device = "distributed"
+            reference_device = "distributed"
+        else:
+            from models.policy_model import PolicyModel
+            from models.reference_model import ReferenceModel
+            from models.value_head import ValueHead
 
-    # Load reference model (4-bit, frozen, always base weights)
-    reference_model = ReferenceModel(model_name=settings.model_name)
+            policy_device = _resolve_device_label(settings.policy_cuda_device, "policy")
+            reference_device = _resolve_device_label(settings.reference_cuda_device, "reference")
 
-    # Build value head — hidden_size must match Phi-3 (3072)
-    value_head = ValueHead(hidden_size=settings.hidden_size).to(
-        policy_model.device
-    )
-    value_head = value_head.to(next(policy_model.model.parameters()).dtype)
+            model_t0 = time.perf_counter()
+            policy_model = PolicyModel(
+                model_name=settings.model_name,
+                checkpoint_path=checkpoint_path,
+                device=policy_device,
+            )
+            logger.info(
+                "startup_stage | stage=policy_model_loaded | elapsed_s=%.2f | device=%s",
+                time.perf_counter() - model_t0,
+                policy_model.device,
+            )
 
-    # Load value head weights if checkpoint exists
-    if latest_ckpt is not None:
-        vh_path = latest_ckpt / "value_head.pt"
-        if vh_path.exists():
-            import torch
-            state = torch.load(vh_path, map_location=str(policy_model.device))
-            value_head.load_state_dict(state)
-            logger.info("Value head weights loaded from checkpoint")
+            model_t0 = time.perf_counter()
+            reference_model = ReferenceModel(
+                model_name=settings.model_name,
+                device=reference_device,
+            )
+            logger.info(
+                "startup_stage | stage=reference_model_loaded | elapsed_s=%.2f | device=%s",
+                time.perf_counter() - model_t0,
+                reference_model.device,
+            )
 
-    rollout_loader     = RolloutLoader(rollouts_dir=settings.rollouts_dir)
-    checkpoint_manager = CheckpointManager(
-        checkpoints_dir=settings.checkpoints_dir,
-        max_checkpoints=settings.max_checkpoints,
-    )
+            model_t0 = time.perf_counter()
+            value_head = ValueHead(hidden_size=settings.hidden_size).to(policy_model.device)
+            if latest_ckpt is not None and load_checkpoint_weights:
+                value_head_path = latest_ckpt / "value_head.pt"
+                if value_head_path.exists():
+                    state = torch.load(value_head_path, map_location=policy_model.device)
+                    value_head.load_state_dict(state)
+            logger.info(
+                "startup_stage | stage=value_head_ready | elapsed_s=%.2f",
+                time.perf_counter() - model_t0,
+            )
 
-    training_loop = TrainingLoop(
-        rollout_loader=rollout_loader,
-        checkpoint_manager=checkpoint_manager,
-        policy_model=policy_model,
-        reference_model=reference_model,
-        value_head=value_head,
-    )
+            training_loop = TrainingLoop(
+                rollout_loader=rollout_loader,
+                checkpoint_manager=checkpoint_manager,
+                policy_model=policy_model,
+                reference_model=reference_model,
+                value_head=value_head,
+            )
 
-    # FIX: pass rollouts_dir so POST /rollout knows where to write files
-    set_training_loop(training_loop, settings.rollouts_dir)
-    logger.info("RL components initialised. Service is ready.")
+        set_training_loop(training_loop, settings.rollouts_dir)
+        logger.info(
+            "startup_stage | stage=training_loop_bound | elapsed_s=%.2f",
+            time.perf_counter() - stage_t0,
+        )
 
-    yield  # ── application runs here ──────────────────────────────────────
+        logger.info(
+            "rl_startup_complete | total_elapsed_s=%.2f | policy_device=%s | reference_device=%s",
+            time.perf_counter() - startup_t0,
+            policy_device,
+            reference_device,
+        )
 
-    logger.info("Shutting down RL training microservice.")
+        yield
+    except Exception:
+        logger.exception("rl_startup_failed")
+        raise
+    finally:
+        logger.info("rl_shutdown")
 
 
 app = FastAPI(
     title="RL Training Microservice",
-    description=(
-        "PPO-based RL trainer that fine-tunes the Prompt Rewriter "
-        "using trajectories collected from the ICD coding pipeline."
-    ),
     version="0.1.0",
     lifespan=lifespan,
 )
 
 app.include_router(router)
-# """
-# FastAPI application entry point for the RL training microservice.
-
-# Start with:
-#     uvicorn app.main:app --reload
-
-# All heavy model loading happens once at startup via the lifespan context.
-# """
-
-# import logging
-# import sys
-# from contextlib import asynccontextmanager
-# from pathlib import Path
-
-# # Make project root importable when launched with uvicorn from rl_loop_svc/
-# sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-# from fastapi import FastAPI
-
-# from app.api_routes import router, set_training_loop
-# from app.config import settings
-
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-# )
-# logger = logging.getLogger(__name__)
-
-
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     """
-#     Application lifespan handler.
-
-#     Initialises all RL components on startup and tears down cleanly on
-#     shutdown.  Heavy model loading (GPU / CPU) happens here so the API
-#     is ready before accepting requests.
-#     """
-#     logger.info("Starting RL training microservice …")
-
-#     # Ensure required directories exist
-#     settings.rollouts_dir.mkdir(parents=True, exist_ok=True)
-#     settings.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-#     # ── Lazy import to keep startup fast during testing ───────────────────
-#     from models.policy_model import PolicyModel
-#     from models.reference_model import ReferenceModel
-#     from models.value_head import ValueHead
-#     from rl.training_loop import TrainingLoop
-#     from storage.checkpoint_manager import CheckpointManager
-#     from storage.rollout_loader import RolloutLoader
-
-#     policy_model = PolicyModel(model_name=settings.model_name)
-#     reference_model = ReferenceModel(model_name=settings.model_name)
-#     value_head = ValueHead(hidden_size=settings.hidden_size).to(policy_model.device)
-
-#     rollout_loader = RolloutLoader(rollouts_dir=settings.rollouts_dir)
-#     checkpoint_manager = CheckpointManager(
-#         checkpoints_dir=settings.checkpoints_dir,
-#         max_checkpoints=settings.max_checkpoints,
-#     )
-
-#     training_loop = TrainingLoop(
-#         rollout_loader=rollout_loader,
-#         checkpoint_manager=checkpoint_manager,
-#         policy_model=policy_model,
-#         reference_model=reference_model,
-#         value_head=value_head,
-#     )
-
-#     set_training_loop(training_loop)
-#     logger.info("RL components initialised. Service is ready.")
-
-#     yield  # ── application runs here ──────────────────────────────────────
-
-#     logger.info("Shutting down RL training microservice.")
-
-
-# app = FastAPI(
-#     title="RL Training Microservice",
-#     description=(
-#         "PPO-based RL trainer that fine-tunes the Prompt Rewriter language model "
-#         "using trajectories collected from the ICD coding pipeline."
-#     ),
-#     version="0.1.0",
-#     lifespan=lifespan,
-# )
-
-# app.include_router(router)

@@ -1,11 +1,17 @@
 """Pydantic request and response schemas for the rewriter inference service."""
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
 class RewriteRequest(BaseModel):
     """Schema for the rewrite prompt request."""
 
+    note_id: Optional[str] = Field(
+        default=None,
+        description="Optional note identifier used for cache lookups.",
+    )
     clinical_note: str = Field(
         ...,
         min_length=1,
@@ -27,4 +33,8 @@ class RewriteResponse(BaseModel):
     value_estimate: float = Field(
         ...,
         description="Scalar value predicted by the value head.",
+    )
+    generation_source: str = Field(
+        ...,
+        description="Source of rewrite generation (model, cache, guided fallback, or rule fallback).",
     )

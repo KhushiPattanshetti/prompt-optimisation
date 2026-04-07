@@ -30,8 +30,8 @@ class KLController:
 
     def compute_kl(
         self,
-        log_prob_policy: torch.Tensor,
-        log_prob_reference: torch.Tensor,
+        lp_policy: torch.Tensor,
+        lp_ref: torch.Tensor,
     ) -> torch.Tensor:
         """
         Element-wise KL divergence estimate.
@@ -43,7 +43,9 @@ class KLController:
         Returns:
             kl: Shape (B,) — KL divergence per sample.
         """
-        kl = log_prob_policy - log_prob_reference
+        # KL divergence is always >= 0
+        # Clamp to non-negative to prevent negative KL from corrupting loss
+        kl = (lp_policy - lp_ref).clamp(min=0.0)
         self._last_kl = kl.mean().item()
         return kl
 
@@ -73,3 +75,7 @@ class KLController:
     def last_kl(self) -> float:
         """Most recently computed mean KL divergence."""
         return self._last_kl
+
+    @last_kl.setter
+    def last_kl(self, value: float) -> None:
+        self._last_kl = float(value)

@@ -30,7 +30,18 @@ class _StubPolicyModel(nn.Module):
         super().__init__()
         self.linear = nn.Linear(1, 1)
         self.device = torch.device("cpu")
-        self.model = self  # checkpoint_manager calls self.model.state_dict()
+
+        class _AdapterHolder:
+            def __init__(self, parent: "_StubPolicyModel"):
+                self.parent = parent
+
+            def save_pretrained(self, path: str) -> None:
+                target = Path(path)
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+                torch.save(self.parent.state_dict(), target / "adapter_model.bin")
+
+        self.model = _AdapterHolder(self)
 
     def forward(self, input_ids, attention_mask=None):
         B, T = input_ids.shape
@@ -95,7 +106,7 @@ def populated_rollouts_dir(tmp_path, rollout_entry):
     d = tmp_path / "rollouts"
     d.mkdir()
     batch = {"rollouts": [rollout_entry] * 4}
-    (d / "batch_001.json").write_text(json.dumps(batch))
+    (d / "rollout_batch_001.json").write_text(json.dumps(batch))
     return d
 
 
@@ -149,7 +160,8 @@ class TestFullCycle:
         ckpts = list(ckpt_dir.iterdir())
         assert len(ckpts) == 1
         ckpt = ckpts[0]
-        assert (ckpt / "policy_model.pt").exists()
+        assert (ckpt / "lora_adapter").is_dir()
+        assert (ckpt / "lora_adapter" / "adapter_config.json").exists()
         assert (ckpt / "value_head.pt").exists()
         assert (ckpt / "optimizer.pt").exists()
         assert (ckpt / "training_state.json").exists()
@@ -190,7 +202,7 @@ class TestFullCycle:
 
         # Write one file per cycle so each run_once() sees exactly one new file
         for i in range(3):
-            (d / f"batch_{i:03d}.json").write_text(
+            (d / f"rollout_batch_{i:03d}.json").write_text(
                 json.dumps({"rollouts": [entry] * 2})
             )
             loop.run_once()
