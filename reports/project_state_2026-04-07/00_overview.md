@@ -14,6 +14,9 @@ Current state:
 - Distributed RL training now has strong failure visibility and guardrails.
 - Remaining critical runtime risk is GPU OOM during distributed RL train cycles under heavy memory pressure.
 
+Detailed companion report:
+- reports/project_state_2026-04-07/07_theoretical_concepts_flow_methods_schemas.md
+
 ## Git change summary since clone baseline
 
 Relative to origin/main:
