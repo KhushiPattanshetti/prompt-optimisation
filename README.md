@@ -62,12 +62,27 @@ Expected files:
 
 - [data/notes.csv](data/notes.csv)
 - [data/diagnoses.csv](data/diagnoses.csv)
+- [data/section111_valid_icd10_october2025.xlsx](data/section111_valid_icd10_october2025.xlsx)
 
 If missing, download them:
 
 ```bash
+# Optional but recommended for ICD spreadsheet auto-download:
+# export ICD10_SECTION111_XLSX_FILE_ID=<google_drive_file_id>
 python data/download_data.py
 ```
+
+Generate the ICD-10 hierarchy JSON locally (not tracked in git):
+
+```bash
+python scripts/build_icd10_tree.py
+```
+
+This creates:
+
+- [reward_metrics_svc/icd10_tree.json](reward_metrics_svc/icd10_tree.json)
+
+Run this once after downloading/updating the ICD spreadsheet.
 
 ## 5) Start Services
 
@@ -186,7 +201,9 @@ docker compose down -v
 - Service does not become healthy:
   - Run `docker compose logs -f <service_name>` and check model/data path errors.
 - Data file missing errors:
-  - Ensure [data/notes.csv](data/notes.csv) and [data/diagnoses.csv](data/diagnoses.csv) exist, or run `python data/download_data.py`.
+  - Ensure [data/notes.csv](data/notes.csv), [data/diagnoses.csv](data/diagnoses.csv), and [data/section111_valid_icd10_october2025.xlsx](data/section111_valid_icd10_october2025.xlsx) exist, or run `python data/download_data.py`.
+- Missing ICD tree JSON:
+  - Run `python scripts/build_icd10_tree.py` to regenerate [reward_metrics_svc/icd10_tree.json](reward_metrics_svc/icd10_tree.json).
 - RL train-cycle failures:
   - Check [rl_loop_svc](rl_loop_svc) logs and `http://localhost:8004/status` fields such as `last_train_success` and `last_train_error`.
 - Reward transport degradation:

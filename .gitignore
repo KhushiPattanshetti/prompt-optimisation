@@ -31,6 +31,7 @@ llm.txt
 hf_cache/
 inference_outputs/
 reward_queue/
+reward_metrics_svc/icd10_tree.json
 
 # Runtime rollouts and local state
 rl_loop_svc/rollouts/*.jsonl

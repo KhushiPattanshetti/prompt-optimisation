@@ -1,4 +1,4 @@
-"""Download dataset CSV files from Google Drive using gdown.
+"""Download dataset files from Google Drive using gdown.
 
 Usage:
     pip install gdown
@@ -6,22 +6,39 @@ Usage:
 """
 
 from pathlib import Path
+import os
 
 import gdown
 
 # --- Google Drive file IDs (update these when files change) ---
 NOTES_FILE_ID = "1UbaMm5bG8Axacwc6MWhhMzZO2PqC6Ibs"
 DIAGNOSES_FILE_ID = "14N_NjkppC_-xUlvseP_oVxUNmeyrqHT3"
+# Optional: ICD-10 source spreadsheet used by scripts/build_icd10_tree.py
+# Set via env var or edit this constant directly.
+ICD10_SECTION111_XLSX_FILE_ID = os.environ.get(
+    "ICD10_SECTION111_XLSX_FILE_ID",
+    "18aYookEAjw9nn7KPM90lQBzKJlYpva4R",
+).strip()
 
 # --- Destination paths (resolved relative to this script) ---
 DATA_DIR = Path(__file__).resolve().parent
 NOTES_CSV_PATH = DATA_DIR / "notes.csv"
 DIAGNOSES_CSV_PATH = DATA_DIR / "diagnoses.csv"
+ICD10_SECTION111_XLSX_PATH = DATA_DIR / "section111_valid_icd10_october2025.xlsx"
 
 FILES = [
     {"name": "notes.csv", "file_id": NOTES_FILE_ID, "dest": NOTES_CSV_PATH},
     {"name": "diagnoses.csv", "file_id": DIAGNOSES_FILE_ID, "dest": DIAGNOSES_CSV_PATH},
 ]
+
+if ICD10_SECTION111_XLSX_FILE_ID:
+    FILES.append(
+        {
+            "name": "section111_valid_icd10_october2025.xlsx",
+            "file_id": ICD10_SECTION111_XLSX_FILE_ID,
+            "dest": ICD10_SECTION111_XLSX_PATH,
+        }
+    )
 
 
 def download_file(name: str, file_id: str, dest: Path) -> None:
@@ -55,6 +72,13 @@ def main() -> None:
     """Download all required dataset files."""
     for file_info in FILES:
         download_file(file_info["name"], file_info["file_id"], file_info["dest"])
+
+    if not ICD10_SECTION111_XLSX_FILE_ID and not ICD10_SECTION111_XLSX_PATH.exists():
+        print(
+            "[WARN] ICD spreadsheet file ID is not configured and section111_valid_icd10_october2025.xlsx "
+            "is missing. Set ICD10_SECTION111_XLSX_FILE_ID to enable auto-download."
+        )
+
     print("\nAll dataset files are ready.")
 
 

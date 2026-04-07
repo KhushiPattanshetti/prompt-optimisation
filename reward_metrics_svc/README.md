@@ -24,10 +24,16 @@ This microservice computes a scalar reward in [-1.0, 1.0] using ICD-10 code eval
 ### 2. Directory Structure
 
 - `main.py` : API and core logic
-- `icd10_tree.json` : ICD-10 tree structure (JSON)
+- `icd10_tree.json` : ICD-10 tree structure (JSON, generated locally)
 - `gt_codes/` : Directory with ground truth codes (JSON files)
 - `test/` : Unit and integration tests
 - `llm.json`, `llm.txt` : Design and requirements
+
+Generate the ICD tree locally from the source spreadsheet in `data/`:
+
+```bash
+python scripts/build_icd10_tree.py
+```
 
 ### 3. Running the Service
 
