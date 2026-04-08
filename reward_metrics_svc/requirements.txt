@@ -1,5 +1,5 @@
 fastapi
-uvicorn
-networkx
+uvicorn[standard]
+pydantic
 pytest
-requests
+httpx
