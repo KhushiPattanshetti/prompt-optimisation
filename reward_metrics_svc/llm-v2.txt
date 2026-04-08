@@ -1,0 +1,557 @@
+You are a senior backend engineer and system designer.
+I am building a microservice called reward_metrics_svc for a Reinforcement Learning Pipeline.
+I have provided the complete specification of the microservice below.
+You MUST strictly follow it.
+
+LLM Specifications
+
+1. Overview
+
+This microservice computes a scalar reward ∈ [-1.0, 1.0] for Reinforcement Learning (PPO loop) by comparing:
+
+- Ground Truth ICD-10 codes (gt_codes)
+- Enhanced ICD-10 codes (enh_codes)
+- Original ICD-10 codes (org_codes)
+
+The reward is improvement-based and hybrid, measuring whether enhanced codes are closer to ground truth than original codes, while also incorporating correctness and structural validity.
+
+2. Core Design Philosophy
+
+The system is divided into two layers:
+
+2.1 Distance Layer
+distance_between(gt, pred) → structured semantic distance ∈ [0,1]
+
+2.2 Reward Layer (Hybrid v2)
+R_total = tanh(w_tree * (D_org - D_enh)
+    + w_exact * R_exact
+    + w_structure * R_structure
+)
+
+This ensures:
+- Smooth gradients for PPO
+- Hierarchy-aware learning
+- Strong correctness signal
+- Robust handling of malformed outputs
+
+3. Inputs
+
+3.1 ICD-10 Tree Structure
+- Preloaded in-memory
+- Built from official ICD hierarchy
+- Pruned using dataset codes
+- Contains:
+    - parent_map: Dict[str, str]
+    - depth_map: Dict[str, int]
+- Precompute:
+    - max_depth = max(depth_map.values())
+
+3.2 Runtime Inputs 
+
+The ICD-10 Coding Block posts the runtime input at:
+- http://localhost:8001/generate_codes
+
+It return the following payload:
+class CodeResponse(BaseModel):
+    note_id: str 
+    enh_codes: List[str]
+    org_codes: List[str]
+    gt_codes: List[str]
+    enh_raw_output: str (raw LLM response containing enh_codes)
+    org_raw_codes: str (raw LLM response containing org_codes)
+    parsing_success: bool
+    invalid_codes: List[str]
+    duplicate_codes: List[str]
+    state: str
+    action: str
+    log_prob_old: float
+    value_estimate: float
+
+4. Preprocessing Rules
+
+Before any computation:
+
+- Convert all code lists to sets:
+    - gt_codes = unique(gt_codes)
+    - enh_codes = unique(enh_codes)
+    - org_codes = unique(org_codes)
+- Validate codes against ICD tree
+- If parsing_success == False:
+    - R_structure = -1 (strong penalty)
+
+5. Core Function Signatures
+
+sim(code_a: str, code_b: str) -> float
+distance(code_a: str, code_b: str) -> float
+set_distance(gt: List[str], pred: List[str]) -> float
+coverage_penalty(gt: List[str], pred: List[str]) -> float
+extra_penalty(gt: List[str], pred: List[str]) -> float
+cardinality_penalty(gt: List[str], pred: List[str]) -> float
+distance_between(gt: List[str], pred: List[str]) -> float
+compute_reward(gt, enh, org) -> float
+
+6. Code-Level Similarity (Wu-Palmer)
+
+6.1 depth(code):
+
+depth(code) = number of edges from ROOT to node
+
+- Precomputed using BFS
+- Stored in depth_map
+
+Fallback:
+- If code not found:
+    infer using string heuristic
+
+6.2 LCA(code_a, code_b)
+
+Lowest Common Ancestor using parent_map
+
+Algorithm:
+
+ancestors_a = set()
+curr = code_a
+while curr exists:
+    ancestors_a.add(curr)
+    curr = parent_map[curr]
+
+curr = code_b
+while curr not in ancestors_a:
+    curr = parent_map[curr]
+
+return curr
+
+6.3 Wu-Palmer Similarity
+
+sim(a, b) = 2 * depth(LCA(a,b)) / (depth(a) + depth(b))
+distance(a, b) = 1 - sim(a, b)
+
+7. Set-to-Set Distance
+
+Handles edge cases:
+- If pred empty -> return 1.0
+- If gt empty -> return 0.0
+- If both empty -> return 0.0
+
+D_set = (D_gt->pred + D_pred->gt) / 2
+
+D_gt->pred = avg(min distance(gt_i, pred_j))
+D_pred->gt = avg(min distance(pred_j, gt_i))
+
+8. Coverage Penalty (GT -> Pred)
+
+For each gt_i:
+- coverage_score = max sim(gt_i, pred_j)
+- weight = depth(gt_i) / max_depth
+- penalty(gt_i) = weight * (1 - coverage_score)
+
+P_cov = avg over all gt_i
+
+9. Extra Codes Penalty (Pred -> GT)
+
+For each pred_j:
+- match_score = max sim(pred_j, gt_i)
+- weight = 1 - (depth(pred_j) / max_depth)
+- penalty(pred_j) = weight * (1 - match_score)
+
+P_extra = avg over all pred_j
+P_extra_final = λ_extra * P_extra
+
+λ_extra ∈ [0.3, 0.5]
+
+10. Cardinality Penalty
+
+n_gt = len(gt_codes)
+n_pred = len(pred_codes)
+
+If n_gt == 0:
+    return 0
+
+- P_card = |n_pred - n_gt| / n_gt
+- P_card_norm = min(1, P_card)
+- P_card_final = λ_card * P_card_norm
+
+λ_card ∈ [0.2, 0.4]
+
+11. Composite Distance Function
+
+distance_between(gt, pred):
+
+11.1 Compute:
+D_set
+P_cov
+P_extra_final
+P_card_final
+
+11.2 Combine:
+D = α * D_set
+  + β * P_cov
+  + γ * P_extra_final
+  + δ * P_card_final
+
+11.3 Normalize:
+D_final = D / (α + β + γ + δ)
+
+Recommended:
+- α = 0.4
+- β = 0.3
+- γ = 0.2
+- δ = 0.1
+
+Return D_final ∈ [0,1]
+
+12. Additional Reward Components
+
+12.1 Exact Reward
+
+Jaccard similarity:
+
+J = |gt ∩ enh| / |gt ∪ enh|
+R_exact = 2 * J - 1
+
+Range: [-1, 1]
+
+12.2 Structure Reward
+
+R_structure = 1 - penalty_invalid
+    - penalty_duplicates
+    - penalty_format
+
+Where:
+
+penalty_invalid = len(invalid_codes) / max(1, len(enh_codes))
+penalty_duplicates = len(duplicate_codes) / max(1, len(enh_codes))
+
+Clamp R_structure ∈ [-1, 1]
+
+If parsing_success == False:
+    R_structure = -1
+
+13. Reward Function
+
+compute_reward(gt, enh, org):
+
+D_enh = distance_between(gt, enh)
+D_org = distance_between(gt, org)
+
+ΔD = D_org - D_enh
+
+R_tree = ΔD
+
+R_total = tanh(w_tree * R_tree
+    + w_exact * R_exact
+    + w_structure * R_structure
+)
+
+Return reward ∈ [-1,1]
+
+Recommended:
+- w_tree = 0.6
+- w_exact = 0.25
+- w_structure = 0.15
+
+14 API Contracts
+
+14.1 POST /compute_reward
+
+Request:
+- From input class parse and create the following payload for use:
+{
+  "note_id": str,
+  "enh_codes": List[str],
+  "org_codes": List[str],
+  "gt_codes": List[str],
+  :parsing_success": bool,
+}
+
+Response 
+- The structure of json should be as mentioned below:
+{
+  "note_id": str,
+  "reward": float,
+  "metrics": {
+    "D_enh": float,
+    "D_org": float,
+    "delta_D": float,
+    "reward_components": {
+        "R_tree": float,
+        "R_exact": float,
+        "R_structure": float,
+    }
+    "components_enh": {
+        "D_set": float,
+        "P_cov": float,
+        "P_extra": float,
+        "P_card": float,
+    },
+    "components_org": {
+        "D_set": float,
+        "P_cov": float,
+        "P_extra": float,
+        "P_card": float,
+    },
+    "diagnostics": {
+        "worst_gt_coverage_code": str,
+        "worst_pred_match_code": str,
+        "invalid_codes": List[str],
+        "duplicate_codes": List[str],
+    }
+  }
+}
+
+14.2 POST /health
+
+Returns:
+- service status
+- tree loaded status
+- node count
+
+15. Explainable Logging (MANDATORY)
+
+15.1 Per Request Logs
+- note_id
+- gt_codes, enh_codes, org_codes
+- D_enh, D_org, ΔD
+- reward
+
+15.2 Component-Level Logs
+
+For each GT code:
+- coverage_score
+- depth
+- penalty contribution
+
+For each predicted code:
+- match_score
+- depth
+- penalty contribution
+
+R_tree, R_exact, R_structure
+
+15.3 Critical Debug Logs
+- GT codes with LOWEST coverage_score
+- Pred codes with LOWEST match_score
+- LCA pairs used
+- depth values used
+- invalid codes 
+- duplicate codes 
+- parsing status 
+
+15.4 Aggregate Metrics
+- avg reward
+- reward distribution histogram
+- % positive vs negative rewards
+- avg ΔD
+- most frequent mismatched ICD categories
+- % parsing failures
+
+16. Rollout Queue System
+
+Directory Structure:
+rollouts/
+pending/
+acked/
+failed/
+
+Flow:
+1. Compute reward
+2. Save rollout to pending/
+3. Attempt POST to RL service
+4. On success -> move to acked/
+5. On failure -> move to failed/
+
+Rollout Payload:
+{
+    "note_id": str,
+    "state": str,
+    "action": str,
+    "reward": float,
+    "log_prob_old": float,
+    "value_estimate": float
+}
+
+17. Constraints
+- All computations must be deterministic
+- No thresholds (continuous scoring only)
+- Time complexity: O(|GT| * |Pred|)
+- No randomness allowed
+- No external API calls during reward computation
+
+18. Config
+
+All hyperparameters configurable:
+- α, β, γ, δ
+- λ_extra
+- λ_card
+- w_tree
+- w_exact
+- w_structure
+
+19. Simulation Module
+
+Purpose:
+Validate correctness, robustness, and interaction of all reward components:
+- Tree-based distance (R_tree)
+- Exact reward (R_exact)
+- Structure reward (R_structure)
+
+19.1 Improvement (Tree Signal)
+
+gt = ["J45.0"]
+enh = ["J45"]
+org = ["I10"]
+
+Expected:
+- D_enh < D_org
+- R_tree > 0
+- R_exact < 1
+- R_structure ≈ 1
+- reward > 0
+
+19.2 Perfect Match (Exact Reward Dominance)
+
+gt = ["J45.0"]
+enh = ["J45.0"]
+org = ["J45"]
+
+Expected:
+- D_enh ≈ 0
+- R_exact = 1
+- R_structure = 1
+- reward ≈ 1
+
+19.3 No Improvement (Neutral Case)
+
+gt = ["J45.0"]
+enh = ["I10"]
+org = ["I10"]
+
+Expected:
+- D_enh == D_org
+- R_tree ≈ 0
+- R_exact ≈ -1
+- reward ≈ 0 or slightly negative
+
+19.4 Worse Prediction
+
+gt = ["J45.0"]
+enh = ["I10"]
+org = ["J45"]
+
+Expected:
+- D_enh > D_org
+- R_tree < 0
+- reward < 0
+
+19.5 Overprediction (Extra Codes Penalty)
+
+gt = ["J45.0"]
+enh = ["J45.0", "I10"]
+org = ["J45"]
+
+Expected:
+- Moderate penalty from P_extra and P_card
+- R_exact < 1
+- reward slightly lower than perfect match
+
+19.6 Underprediction (Missing Codes)
+
+gt = ["J45.0", "I10"]
+enh = ["J45.0"]
+org = ["J45.0"]
+
+Expected:
+- Coverage penalty active
+- R_exact < 1
+- reward reduced
+
+19.7 Duplicate Codes (Structure Penalty)
+
+gt = ["J45.0"]
+enh = ["J45.0", "J45.0"]
+org = ["J45"]
+
+Expected:
+- duplicate_codes detected
+- R_structure < 1
+- reward penalized slightly
+
+19.8 Invalid Codes (Structure Penalty)
+
+gt = ["J45.0"]
+enh = ["INVALID_CODE"]
+org = ["J45"]
+
+Expected:
+- invalid_codes detected
+- R_structure significantly reduced
+- reward negative
+
+19.9 Parsing Failure (Hard Penalty)
+
+gt = ["J45.0"]
+enh = []
+org = ["J45"]
+parsing_success = False
+
+Expected:
+- R_structure = -1
+- reward strongly negative
+
+19.10 Hierarchical Similarity Check
+
+gt = ["J45.0"]
+enh = ["J45"]
+org = ["J40-J47"]
+
+Expected:
+- sim(J45.0, J45) > sim(J45.0, J40-J47)
+- D_enh < D_org
+- reward > 0
+
+19.11 Completely Unrelated Codes
+
+gt = ["J45.0"]
+enh = ["A01.1"]
+org = ["I10"]
+
+Expected:
+- low similarity across all
+- R_exact ≈ -1
+- reward near or below 0
+
+19.12 Mixed Quality Prediction
+
+gt = ["J45.0", "I10"]
+enh = ["J45", "INVALID_CODE"]
+org = ["J45"]
+
+Expected:
+- partial coverage
+- invalid code penalty
+- moderate reward degradation
+
+19.13 Cardinality Stress Test
+
+gt = ["J45.0"]
+enh = ["J45.0", "I10", "A01.1", "B20"]
+org = ["J45"]
+
+Expected:
+- high P_card penalty
+- reward reduced significantly
+
+19.14 Symmetry Check (Sanity)
+
+Swap enh and org:
+
+Expected:
+- reward flips sign approximately
+
+15.15 Determinism Check
+
+Run same input multiple times:
+
+Expected:
+- identical outputs every time
+

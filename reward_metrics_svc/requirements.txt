@@ -1,10 +1,5 @@
 fastapi
-uvicorn
-networkx
-requests
+uvicorn[standard]
 pydantic
 pytest
 httpx
-numpy
-scipy
-sentence-transformers
