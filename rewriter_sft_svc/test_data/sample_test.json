@@ -1,0 +1,22 @@
+[
+    {
+        "clinical note": "65 y/o M, h/o HTN, DM2, c/o chest pain x2 days, sweating, nausea, ECG done, trop pending, ?ACS, no fever",
+        "structured clinical note": "Patient Demographics:\nAge:\n65\nGender:\nMale\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nHypertension\nType 2 Diabetes Mellitus\nSymptoms:\nChest pain\nSweating\nNausea\nDuration:\n2 days\nInvestigations:\nECG\nTroponin pending\nProcedures:\nNot specified\nComorbidities:\nHypertension\nType 2 Diabetes Mellitus\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "45F, nonsmoker, presented with SOB x1 week, dry cough, low-grade fever 37.8C, CXR: bilateral infiltrates, COVID PCR sent, O2 sat 94% on RA, started on dexamethasone",
+        "structured clinical note": "Patient Demographics:\nAge:\n45\nGender:\nFemale\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nShortness of breath\nDry cough\nLow-grade fever\nDuration:\n1 week\nInvestigations:\nChest X-ray\nCOVID PCR\nOxygen saturation\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNonsmoker\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "72M, CKD stage 3, BPH, presented with urinary retention, catheter inserted, Cr 2.1, US kidney: no hydronephrosis, urology consult",
+        "structured clinical note": "Patient Demographics:\nAge:\n72\nGender:\nMale\nPrimary Diagnosis:\nUrinary retention\nSecondary Diagnoses:\nChronic kidney disease stage 3\nBenign prostatic hyperplasia\nSymptoms:\nUrinary retention\nDuration:\nNot specified\nInvestigations:\nCreatinine\nKidney ultrasound\nProcedures:\nUrinary catheter insertion\nComorbidities:\nChronic kidney disease stage 3\nBenign prostatic hyperplasia\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "30F, G2P1, 36wks, c/o headache, BP 158/102, proteinuria +3, edema bilateral LE, CTG reactive, admit for monitoring, Mg sulfate started",
+        "structured clinical note": "Patient Demographics:\nAge:\n30\nGender:\nFemale\nPrimary Diagnosis:\nPre-eclampsia\nSecondary Diagnoses:\nNot specified\nSymptoms:\nHeadache\nBilateral lower extremity edema\nDuration:\nNot specified\nInvestigations:\nBlood pressure measurement\nUrine protein\nCardiotocography\nProcedures:\nMagnesium sulfate administration\nComorbidities:\nNot specified\nRisk Factors:\nG2P1\n36 weeks gestation\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "58M, known CAD s/p CABG 2019, admitted with progressive dyspnea, orthopnea, PND, LE edema, echo: EF 30%, BNP 2300, Dx: acute decompensated HF, started on IV furosemide",
+        "structured clinical note": "Patient Demographics:\nAge:\n58\nGender:\nMale\nPrimary Diagnosis:\nAcute decompensated heart failure\nSecondary Diagnoses:\nCoronary artery disease\nSymptoms:\nProgressive dyspnea\nOrthopnea\nParoxysmal nocturnal dyspnea\nLower extremity edema\nDuration:\nNot specified\nInvestigations:\nEchocardiogram\nBNP\nProcedures:\nIV furosemide\nComorbidities:\nCoronary artery disease\nPrior CABG\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    }
+]

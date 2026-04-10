@@ -1,0 +1,14 @@
+[
+    {
+        "clinical note": "55M, T2DM, HTN, presented with polyuria, polydipsia x1 week, glucose 28 mmol/L, ketones 3+, ABG: pH 7.22, pCO2 28, HCO3 12. Dx: DKA. IV insulin infusion, IV fluid resuscitation, electrolyte monitoring.",
+        "structured clinical note": "Patient Demographics:\nAge:\n55\nGender:\nMale\nPrimary Diagnosis:\nDiabetic ketoacidosis\nSecondary Diagnoses:\nType 2 Diabetes Mellitus\nHypertension\nSymptoms:\nPolyuria\nPolydipsia\nDuration:\n1 week\nInvestigations:\nBlood glucose\nUrine ketones\nArterial blood gas\nProcedures:\nIV insulin infusion\nIV fluid resuscitation\nElectrolyte monitoring\nComorbidities:\nType 2 Diabetes Mellitus\nHypertension\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "28F, no PMHx, presented with sudden onset severe headache, neck stiffness, photophobia, vomiting, fever 39.2C, LP: turbid fluid, WBC 800 (poly), glucose 1.2, protein 3.8. Dx: bacterial meningitis. IV ceftriaxone + dexamethasone started. Neuro consult.",
+        "structured clinical note": "Patient Demographics:\nAge:\n28\nGender:\nFemale\nPrimary Diagnosis:\nBacterial meningitis\nSecondary Diagnoses:\nNot specified\nSymptoms:\nSudden onset severe headache\nNeck stiffness\nPhotophobia\nVomiting\nFever\nDuration:\nNot specified\nInvestigations:\nLumbar puncture\nCSF glucose\nCSF protein\nCSF cell count\nProcedures:\nIV ceftriaxone\nIV dexamethasone\nNeurology consultation\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "70M, CKD4, T2DM, HTN, presented with rapidly progressive renal failure, Cr 7.2 from baseline 3.1 over 3 weeks, oliguria, peripheral edema ++, K 6.2, bicarb 14. Renal US: bilateral small echogenic kidneys. Nephrology consult, HD initiated. Dx: ESRD requiring emergent dialysis.",
+        "structured clinical note": "Patient Demographics:\nAge:\n70\nGender:\nMale\nPrimary Diagnosis:\nEnd-stage renal disease requiring emergent dialysis\nSecondary Diagnoses:\nChronic kidney disease stage 4\nType 2 Diabetes Mellitus\nHypertension\nSymptoms:\nOliguria\nPeripheral edema\nDuration:\nNot specified\nInvestigations:\nCreatinine\nPotassium\nBicarbonate\nRenal ultrasound\nProcedures:\nHemodialysis initiation\nNephrology consultation\nComorbidities:\nChronic kidney disease stage 4\nType 2 Diabetes Mellitus\nHypertension\nRisk Factors:\nNot specified\nComplications:\nRapidly progressive renal failure"
+    }
+]

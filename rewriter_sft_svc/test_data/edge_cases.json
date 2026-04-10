@@ -1,0 +1,34 @@
+[
+    {
+        "clinical note": "fever x3d",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nNot specified\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nFever\nDuration:\n3 days\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "M, chest pain",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nMale\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nChest pain\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "50F HTN only",
+        "structured clinical note": "Patient Demographics:\nAge:\n50\nGender:\nFemale\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nNot specified\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nHypertension\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "DM2 dx only, no symptoms, no investigations",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nNot specified\nPrimary Diagnosis:\nType 2 Diabetes Mellitus\nSecondary Diagnoses:\nNot specified\nSymptoms:\nNot specified\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "pt denies CP, denies SOB, no fever, no cough, no N/V",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nNot specified\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nNot specified\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "?pneumonia vs ?PE, CTA pending, O2 sat 90%",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nNot specified\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nNot specified\nDuration:\nNot specified\nInvestigations:\nCT pulmonary angiography pending\nOxygen saturation\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "55M 55M DM2 DM2 HTN HTN chest pain chest pain",
+        "structured clinical note": "Patient Demographics:\nAge:\n55\nGender:\nMale\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nType 2 Diabetes Mellitus\nHypertension\nSymptoms:\nChest pain\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nType 2 Diabetes Mellitus\nHypertension\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    },
+    {
+        "clinical note": "SOB — could be cardiac or pulmonary, awaiting workup",
+        "structured clinical note": "Patient Demographics:\nAge:\nNot specified\nGender:\nNot specified\nPrimary Diagnosis:\nNot specified\nSecondary Diagnoses:\nNot specified\nSymptoms:\nShortness of breath\nDuration:\nNot specified\nInvestigations:\nNot specified\nProcedures:\nNot specified\nComorbidities:\nNot specified\nRisk Factors:\nNot specified\nComplications:\nNot specified"
+    }
+]
