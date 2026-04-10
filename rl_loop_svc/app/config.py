@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     learning_rate: float = 3e-5
     max_checkpoints: int = 5
 
-    model_name: str = "microsoft/Phi-3-mini-4k-instruct"
+    model_name: str = "ishanmane/phi3-rewriter-sft"
     hidden_size: int = 3072
     policy_cuda_device: int = 0
     reference_cuda_device: int = 0

@@ -9,7 +9,10 @@ RL_CHECKPOINT_PATH: Path = Path(
 )
 OUTPUT_PATH: Path = PROJECT_ROOT / "inference_outputs"
 
-MODEL_NAME: str = "microsoft/Phi-3-mini-4k-instruct"
+MODEL_NAME: str = os.getenv("REWRITER_MODEL_NAME", "ishanmane/phi3-rewriter-sft")
+REWRITER_LOAD_LOCAL_CHECKPOINTS: bool = (
+	os.getenv("REWRITER_LOAD_LOCAL_CHECKPOINTS", "false").strip().lower() == "true"
+)
 
 # Controls how the rewriter model is used:
 # - base: model refines rule-filtered clinical text (default)

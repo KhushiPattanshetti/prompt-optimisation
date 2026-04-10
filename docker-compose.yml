@@ -31,6 +31,8 @@ services:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=${REWRITER_CHECKPOINT_DIR:-/app/rl_checkpoints}
       - HF_HOME=/app/hf_cache
+      - REWRITER_MODEL_NAME=${REWRITER_MODEL_NAME:-ishanmane/phi3-rewriter-sft}
+      - REWRITER_LOAD_LOCAL_CHECKPOINTS=${REWRITER_LOAD_LOCAL_CHECKPOINTS:-false}
       - REWRITER_MODEL_VARIANT=${REWRITER_MODEL_VARIANT:-base}
       - REWRITER_INPUT_MODE=${REWRITER_INPUT_MODE:-dynamic}
       - REWRITER_ENABLE_POSTFILTER_GUARD=${REWRITER_ENABLE_POSTFILTER_GUARD:-true}
@@ -126,7 +128,7 @@ services:
       - HF_HOME=/app/hf_cache
       - NVIDIA_VISIBLE_DEVICES=0,1,2,3
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
-      - RL_MODEL_NAME=microsoft/Phi-3-mini-4k-instruct
+      - RL_MODEL_NAME=${RL_MODEL_NAME:-ishanmane/phi3-rewriter-sft}
       - RL_HIDDEN_SIZE=3072
       - RL_POLICY_CUDA_DEVICE=2
       - RL_REFERENCE_CUDA_DEVICE=3

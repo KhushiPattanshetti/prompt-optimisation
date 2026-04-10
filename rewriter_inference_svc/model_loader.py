@@ -20,6 +20,7 @@ from transformers import (
 from rewriter_inference_svc.config import (
     MODEL_NAME,
     RL_CHECKPOINT_PATH,
+    REWRITER_LOAD_LOCAL_CHECKPOINTS,
     VALUE_HEAD_HIDDEN_SIZE,
 )
 from rewriter_inference_svc.logger import get_logger
@@ -201,7 +202,7 @@ def load_model() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Module]:
     )
     base_model.config.use_cache = True
 
-    checkpoint_dir = _find_latest_checkpoint_dir()
+    checkpoint_dir = _find_latest_checkpoint_dir() if REWRITER_LOAD_LOCAL_CHECKPOINTS else None
     lora_adapter_path = None
     if checkpoint_dir is not None:
         candidate = checkpoint_dir / "lora_adapter"
