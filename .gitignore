@@ -33,7 +33,6 @@ rewriter_sft_svc/.env
 *.pt
 *.bin
 *.ckpt
-*.safetensors
 *.pth
 *.pt.tmp
 *.bin.tmp
