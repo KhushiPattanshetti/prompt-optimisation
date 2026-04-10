@@ -14,7 +14,7 @@ so every other module (and test) always operates on a live tree.
 import json
 import logging
 from collections import deque
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from config import ICD10_TREE_PATH, VIRTUAL_ROOT
 
@@ -95,11 +95,49 @@ def _build(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _parse_indexed_format(
+    index: Dict[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, int], int]:
+    """
+    Parse the new ICD-10 indexed format where each entry has 'parent' and
+    'depth' fields.  Codes are normalised to uppercase; the sentinel value
+    'ROOT' is mapped to VIRTUAL_ROOT.
+    """
+    parent_map: Dict[str, str] = {}
+    depth_map: Dict[str, int] = {VIRTUAL_ROOT: 0}
+
+    for code_raw, entry in index.items():
+        code = code_raw.upper()
+        raw_parent = entry.get("parent")
+        depth_val = int(entry.get("depth", 1))
+        depth_map[code] = depth_val
+        if raw_parent:
+            parent = raw_parent.upper()
+            parent_map[code] = VIRTUAL_ROOT if parent == "ROOT" else parent
+
+    max_d = max((v for k, v in depth_map.items() if k != VIRTUAL_ROOT), default=1)
+    roots = [c for c, p in parent_map.items() if p == VIRTUAL_ROOT]
+    logger.info("ICD-10 tree roots linked to %s: %s", VIRTUAL_ROOT, roots[:10])
+    logger.info(
+        "Tree built | nodes=%d  max_depth=%d",
+        len(depth_map) - 1,
+        max_d,
+    )
+    return parent_map, depth_map, max_d
+
+
 def load() -> None:
     """Parse ICD10_TREE_PATH and populate the module-level `state`."""
     with open(ICD10_TREE_PATH, "r") as fh:
         data = json.load(fh)
-    state.parent_map, state.depth_map, state.max_depth = _build(data)
+    if "index" in data and isinstance(data["index"], dict):
+        # New indexed format: {"version": ..., "index": {"A00.0": {parent, depth, ...}}}
+        state.parent_map, state.depth_map, state.max_depth = _parse_indexed_format(
+            data["index"]
+        )
+    else:
+        # Legacy adjacency-list format: {"A00": ["A00.0", "A00.1"], ...}
+        state.parent_map, state.depth_map, state.max_depth = _build(data)
     state.loaded = True
 
 

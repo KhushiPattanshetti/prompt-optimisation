@@ -37,12 +37,13 @@ def test_infer_depth_heuristic(code, expected):
 @pytest.mark.parametrize(
     "code,expected",
     [
-        ("A00", 1),
-        ("A01", 2),
-        ("A01.1", 3),
-        ("A01.2", 3),
-        ("B00", 1),
-        ("B01", 2),
+        # ROOT=0, chapter=1, block=2, category=3, subcategory=4
+        ("A00", 3),
+        ("A01", 3),
+        ("A01.1", 4),
+        ("A01.2", 4),
+        ("B00", 3),
+        ("B01", 3),
     ],
 )
 def test_depth_known_codes(code, expected):
@@ -75,8 +76,8 @@ def test_lca_parent_child():
 
 
 def test_lca_cousin_codes():
-    # A01.1 and A02.1 share grandparent A00
-    assert lca("A01.1", "A02.1") == "A00"
+    # A01.1 and A02.1 share grandparent A00-A09 (both categories under that block)
+    assert lca("A01.1", "A02.1") == "A00-A09"
 
 
 def test_lca_different_top_branches():
@@ -110,9 +111,9 @@ def test_sim_always_in_range():
 
 def test_sim_siblings_value():
     # sim(A01.1, A01.2) = 2*depth(A01) / (depth(A01.1) + depth(A01.2))
-    #                   = 2*2 / (3+3) = 4/6 ≈ 0.6667
+    #                   = 2*3 / (4+4) = 6/8 = 0.75
     s = sim("A01.1", "A01.2")
-    assert abs(s - 4 / 6) < 1e-9
+    assert abs(s - 6 / 8) < 1e-9
 
 
 def test_sim_different_branches_is_zero():
@@ -129,8 +130,8 @@ def test_sim_cousin_greater_than_cross_branch():
 
 
 def test_sim_sibling_greater_than_cousin():
-    s_sibling = sim("A01.1", "A01.2")  # lca=A01 depth 2
-    s_cousin = sim("A01.1", "A02.1")  # lca=A00 depth 1
+    s_sibling = sim("A01.1", "A01.2")  # lca=A01 depth 3 → sim=0.75
+    s_cousin = sim("A01.1", "A02.1")  # lca=A00-A09 depth 2 → sim=0.5
     assert s_sibling > s_cousin
 
 
