@@ -2,7 +2,6 @@ import torch
 
 from ...rl.grpo_utils import (
     compute_grpo_relative_rewards,
-    resolve_group_id,
     resolve_grpo_group_ids,
 )
 from ...schemas.rollout_schema import RolloutEntry
@@ -19,19 +18,21 @@ def _entry(original_prompt: str, group_id: str | None = None) -> RolloutEntry:
     )
 
 
-def test_resolve_group_id_prefers_existing_group_id():
+def test_grpo_entries_with_preassigned_group_id_are_used_directly():
+    """
+    group_id is now assigned upstream by trajectory_store_svc preprocessing.
+    Entries arriving with a group_id should use it as-is.
+    """
     entry = _entry("note A", group_id="group-123")
-    assert resolve_group_id(entry) == "group-123"
+    assert entry.group_id == "group-123"
 
 
-def test_resolve_group_id_fallback_is_stable_per_prompt():
-    e1 = _entry("same original note")
-    e2 = _entry("same original note")
-    g1 = resolve_group_id(e1)
-    g2 = resolve_group_id(e2)
-
-    assert g1 == g2
-    assert g1.startswith("g_")
+def test_grpo_entries_without_group_id_have_none():
+    """
+    Entries without a group_id (not yet preprocessed) have group_id=None.
+    """
+    e = _entry("same original note")
+    assert e.group_id is None
 
 
 def test_grpo_relative_rewards_zero_when_no_group_meets_threshold():

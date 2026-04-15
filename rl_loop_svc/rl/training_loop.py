@@ -26,8 +26,6 @@ from .grpo_utils import (
     compute_grpo_relative_rewards,
     group_reward_std_mean,
     resolve_grpo_group_ids,
-    resolve_group_id,
-    resolve_sample_weight,
     select_rollout_batch,
 )
 from .kl_controller import KLController
@@ -73,11 +71,15 @@ class TrainingLoop:
         self.policy_model = policy_model
         self.reference_model = reference_model
         self.value_head = value_head
-        self._distributed_mode = settings.distributed_enabled and settings.distributed_world_size > 1
+        self._distributed_mode = (
+            settings.distributed_enabled and settings.distributed_world_size > 1
+        )
 
         if not self._distributed_mode:
             if policy_model is None or reference_model is None:
-                raise ValueError("Local GRPO mode requires policy_model and reference_model")
+                raise ValueError(
+                    "Local GRPO mode requires policy_model and reference_model"
+                )
 
         self.lifecycle = LifecycleManager()
         self.kl_controller = KLController(beta=settings.beta)
@@ -157,6 +159,14 @@ class TrainingLoop:
                 if entry.concept_reward is not None
                 else float(entry.reward)
             )
+            # group_id and sample_weight are pre-computed by trajectory_store_svc
+            # (processing/preprocessing.py) — use them directly without recomputing.
+            group_id = (
+                entry.group_id or f"g_{abs(hash(entry.original_prompt)) % (2**32):08x}"
+            )
+            sample_weight = (
+                float(entry.sample_weight) if entry.sample_weight is not None else 1.0
+            )
             self.buffer.store(
                 reward=entry.reward,
                 log_prob_old=entry.log_prob_old,
@@ -164,8 +174,8 @@ class TrainingLoop:
                 original_prompt=entry.original_prompt,
                 rewritten_prompt=entry.rewritten_prompt,
                 concept_reward=concept_reward,
-                group_id=resolve_group_id(entry),
-                sample_weight=resolve_sample_weight(entry),
+                group_id=group_id,
+                sample_weight=sample_weight,
             )
 
     def _compute_value_estimates(self, prompts: List[str]) -> List[float]:
@@ -192,12 +202,16 @@ class TrainingLoop:
 
     def _run_ppo_epochs(self) -> None:
         if self.policy_model is None or self.reference_model is None:
-            raise RuntimeError("Local GRPO run requested without initialized model components")
+            raise RuntimeError(
+                "Local GRPO run requested without initialized model components"
+            )
         if self.optimizer is None:
             raise RuntimeError("Local GRPO run requested without optimizer")
 
         final_rewards = torch.tensor(self.buffer._rewards, dtype=torch.float32)
-        concept_rewards = torch.tensor(self.buffer._concept_rewards, dtype=torch.float32)
+        concept_rewards = torch.tensor(
+            self.buffer._concept_rewards, dtype=torch.float32
+        )
         rewards = (
             settings.final_reward_beta * final_rewards
             + settings.concept_reward_alpha * concept_rewards
@@ -225,16 +239,18 @@ class TrainingLoop:
         # Fallback for samples in groups too small for GRPO
         fallback_advantages = rewards.clone()
         if fallback_advantages.numel() > 1:
-            fallback_advantages = (
-                fallback_advantages - fallback_advantages.mean()
-            ) / (fallback_advantages.std(unbiased=False) + 1e-6)
+            fallback_advantages = (fallback_advantages - fallback_advantages.mean()) / (
+                fallback_advantages.std(unbiased=False) + 1e-6
+            )
 
         fallback_mask_base = build_grpo_fallback_mask(
             effective_group_ids,
             settings.grpo_min_group_size,
             device=grpo_advantages.device,
         )
-        pure_reward_advantages = torch.where(fallback_mask_base, fallback_advantages, grpo_advantages)
+        pure_reward_advantages = torch.where(
+            fallback_mask_base, fallback_advantages, grpo_advantages
+        )
 
         # Blend with GAE advantages from ValueHead when available
         values_tensor = torch.tensor(self.buffer._values, dtype=torch.float32)
@@ -262,7 +278,11 @@ class TrainingLoop:
             float(rewards.mean().item()) if rewards.numel() else 0.0,
             group_reward_std,
             float(advantages.mean().item()) if advantages.numel() else 0.0,
-            float(advantages.std(unbiased=False).item()) if advantages.numel() > 1 else 0.0,
+            (
+                float(advantages.std(unbiased=False).item())
+                if advantages.numel() > 1
+                else 0.0
+            ),
             int(fallback_mask_base.sum().item()),
             has_value_estimates,
         )
@@ -309,11 +329,15 @@ class TrainingLoop:
         if invalid_span_count > 0:
             keep_idx = torch.nonzero(~invalid_span_mask, as_tuple=False).squeeze(-1)
             if keep_idx.numel() == 0:
-                logger.warning("grpo_skip | reason=no_valid_action_spans_after_tokenization")
+                logger.warning(
+                    "grpo_skip | reason=no_valid_action_spans_after_tokenization"
+                )
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
             current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_attention_mask = _select_optional_tensor(
+                current_attention_mask, keep_idx
+            )
             current_fused_mask = current_fused_mask[keep_idx]
             current_fallback_mask = current_fallback_mask[keep_idx]
 
@@ -327,7 +351,9 @@ class TrainingLoop:
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
             current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_attention_mask = _select_optional_tensor(
+                current_attention_mask, keep_idx
+            )
             current_fused_mask = current_fused_mask[keep_idx]
             current_fallback_mask = current_fallback_mask[keep_idx]
 
@@ -341,7 +367,9 @@ class TrainingLoop:
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
             current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_attention_mask = _select_optional_tensor(
+                current_attention_mask, keep_idx
+            )
             current_fused_mask = current_fused_mask[keep_idx]
             current_fallback_mask = current_fallback_mask[keep_idx]
 
@@ -357,7 +385,9 @@ class TrainingLoop:
             )
             current_batch = select_rollout_batch(current_batch, expand_idx)
             current_input_ids = current_input_ids[expand_idx]
-            current_attention_mask = _select_optional_tensor(current_attention_mask, expand_idx)
+            current_attention_mask = _select_optional_tensor(
+                current_attention_mask, expand_idx
+            )
             current_fused_mask = current_fused_mask[expand_idx]
             current_fallback_mask = current_fallback_mask[expand_idx]
             n = len(current_batch.rewritten_prompts)
@@ -368,10 +398,16 @@ class TrainingLoop:
             for start in range(0, n, settings.batch_size):
                 end = min(start + settings.batch_size, n)
                 mb_ids = current_input_ids[start:end]
-                mb_mask = current_attention_mask[start:end] if current_attention_mask is not None else None
+                mb_mask = (
+                    current_attention_mask[start:end]
+                    if current_attention_mask is not None
+                    else None
+                )
                 mb_fused = current_fused_mask[start:end]
                 ref_lp = self.reference_model.get_sequence_log_prob(
-                    mb_ids, mb_mask, mb_fused,
+                    mb_ids,
+                    mb_mask,
+                    mb_fused,
                 )
                 ref_chunks_cpu.append(ref_lp.detach().cpu())
         ref_log_probs = torch.cat(ref_chunks_cpu, dim=0).to(self.policy_model.device)
@@ -396,7 +432,9 @@ class TrainingLoop:
                 "batch_size_after_filtering": n,
                 "invalid_span_count": filter_diag["invalid_span_count"],
                 "skipped_due_to_nan_reward": filter_diag["skipped_due_to_nan_reward"],
-                "skipped_due_to_non_finite_advantage": filter_diag["skipped_due_to_non_finite_advantage"],
+                "skipped_due_to_non_finite_advantage": filter_diag[
+                    "skipped_due_to_non_finite_advantage"
+                ],
                 "fallback_samples": int(current_fallback_mask.sum().item()),
                 "optimizer_steps": 0,
             }
@@ -407,15 +445,23 @@ class TrainingLoop:
             for start in range(0, n, settings.batch_size):
                 end = min(start + settings.batch_size, n)
                 mb_ids = current_input_ids[start:end]
-                mb_mask = current_attention_mask[start:end] if current_attention_mask is not None else None
+                mb_mask = (
+                    current_attention_mask[start:end]
+                    if current_attention_mask is not None
+                    else None
+                )
                 mb_fused = current_fused_mask[start:end]
 
-                token_log_probs_new, hidden_states, logits = self.policy_model(mb_ids, mb_mask)
+                token_log_probs_new, hidden_states, logits = self.policy_model(
+                    mb_ids, mb_mask
+                )
                 seq_log_prob_new = (token_log_probs_new * mb_fused).sum(dim=-1)
 
                 # Entropy regularization from the logits distribution
                 token_probs = F.softmax(logits, dim=-1)
-                token_entropy = -(token_probs * torch.log(token_probs + 1e-10)).sum(dim=-1)
+                token_entropy = -(token_probs * torch.log(token_probs + 1e-10)).sum(
+                    dim=-1
+                )
                 seq_entropy = (token_entropy * mb_fused).sum(dim=-1)
                 mb_entropy = seq_entropy.mean()
 
@@ -426,17 +472,23 @@ class TrainingLoop:
                     values_old = current_batch.values[start:end].to(values_new.device)
                     returns_mb = current_batch.returns[start:end].to(values_new.device)
                     value_pred_clipped = values_old + (values_new - values_old).clamp(
-                        -settings.value_clip, settings.value_clip,
+                        -settings.value_clip,
+                        settings.value_clip,
                     )
                     vl_unclipped = (values_new - returns_mb).pow(2)
                     vl_clipped = (value_pred_clipped - returns_mb).pow(2)
                     value_loss = 0.5 * torch.max(vl_unclipped, vl_clipped).mean()
 
                 old_log_prob_mb = current_batch.log_probs_old[start:end]
-                if not torch.isfinite(seq_log_prob_new).all() or not torch.isfinite(old_log_prob_mb).all():
+                if (
+                    not torch.isfinite(seq_log_prob_new).all()
+                    or not torch.isfinite(old_log_prob_mb).all()
+                ):
                     logger.warning(
                         "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_log_prob",
-                        epoch + 1, start, end,
+                        epoch + 1,
+                        start,
+                        end,
                     )
                     continue
 
@@ -456,13 +508,20 @@ class TrainingLoop:
 
                 grpo_loss_per_sample = -(adv_mb * seq_log_prob_new)
                 ppo_surr1 = ratio * adv_mb
-                ppo_surr2 = torch.clamp(ratio, 1.0 - settings.epsilon, 1.0 + settings.epsilon) * adv_mb
+                ppo_surr2 = (
+                    torch.clamp(ratio, 1.0 - settings.epsilon, 1.0 + settings.epsilon)
+                    * adv_mb
+                )
                 ppo_loss_per_sample = -torch.min(ppo_surr1, ppo_surr2)
 
                 policy_loss_per_sample = torch.where(
-                    fallback_mb, ppo_loss_per_sample, grpo_loss_per_sample,
+                    fallback_mb,
+                    ppo_loss_per_sample,
+                    grpo_loss_per_sample,
                 )
-                policy_loss = (policy_loss_per_sample * sample_weights).sum() / normalizer
+                policy_loss = (
+                    policy_loss_per_sample * sample_weights
+                ).sum() / normalizer
                 kl_loss = (kl_penalty * sample_weights).sum() / normalizer
                 total_loss = (
                     policy_loss
@@ -474,7 +533,9 @@ class TrainingLoop:
                 if not torch.isfinite(total_loss):
                     logger.warning(
                         "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_total_loss",
-                        epoch + 1, start, end,
+                        epoch + 1,
+                        start,
+                        end,
                     )
                     self.optimizer.zero_grad()
                     continue
@@ -482,9 +543,13 @@ class TrainingLoop:
                 (total_loss / settings.gradient_accumulation_steps).backward()
                 accum_counter += 1
 
-                if accum_counter % settings.gradient_accumulation_steps == 0 or end == n:
+                if (
+                    accum_counter % settings.gradient_accumulation_steps == 0
+                    or end == n
+                ):
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(self.policy_model.parameters()), max_norm=1.0,
+                        list(self.policy_model.parameters()),
+                        max_norm=1.0,
                     )
                     self.optimizer.step()
                     if self.scheduler is not None:
@@ -496,13 +561,19 @@ class TrainingLoop:
                 self.last_loss = float(total_loss.detach().item())
                 logger.info(
                     "grpo_loss_diag | epoch=%d | start=%d | end=%d | policy=%.6f | kl=%.6f | value=%.6f | entropy=%.6f | total=%.6f | grad_norm=%.4f | ratio_max=%.4f | fallback=%d/%d",
-                    epoch + 1, start, end,
+                    epoch + 1,
+                    start,
+                    end,
                     float(policy_loss.detach().item()),
                     float(kl_loss.detach().item()),
                     float(value_loss.detach().item()),
                     float(mb_entropy.detach().item()),
                     self.last_loss,
-                    float(grad_norm) if torch.isfinite(torch.tensor(grad_norm)) else -1.0,
+                    (
+                        float(grad_norm)
+                        if torch.isfinite(torch.tensor(grad_norm))
+                        else -1.0
+                    ),
                     float(ratio.max().detach().item()),
                     int(fallback_mb.sum().item()),
                     int(fallback_mb.numel()),
@@ -516,8 +587,16 @@ class TrainingLoop:
                 self.last_loss,
                 self.kl_controller.last_kl,
                 group_reward_std,
-                float(current_batch.advantages.mean().item()) if len(current_batch.advantages) else 0.0,
-                float(current_batch.advantages.std(unbiased=False).item()) if len(current_batch.advantages) > 1 else 0.0,
+                (
+                    float(current_batch.advantages.mean().item())
+                    if len(current_batch.advantages)
+                    else 0.0
+                ),
+                (
+                    float(current_batch.advantages.std(unbiased=False).item())
+                    if len(current_batch.advantages) > 1
+                    else 0.0
+                ),
                 loaded_batch_size,
                 n,
                 epoch_diag["fallback_samples"],
@@ -540,8 +619,12 @@ class TrainingLoop:
 
         def lr_lambda(current_step: int) -> float:
             if current_step < warmup_steps:
-                return max(float(current_step) / float(max(warmup_steps, 1)), min_lr_ratio)
-            progress = float(current_step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
+                return max(
+                    float(current_step) / float(max(warmup_steps, 1)), min_lr_ratio
+                )
+            progress = float(current_step - warmup_steps) / float(
+                max(total_steps - warmup_steps, 1)
+            )
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return max(min_lr_ratio, cosine_decay)
 
@@ -550,8 +633,14 @@ class TrainingLoop:
     # ── Checkpoint ──────────────────────────────────────────────────────────
 
     def _save_checkpoint(self) -> None:
-        if self.policy_model is None or self.value_head is None or self.optimizer is None:
-            raise RuntimeError("Cannot save local checkpoint without initialized model state")
+        if (
+            self.policy_model is None
+            or self.value_head is None
+            or self.optimizer is None
+        ):
+            raise RuntimeError(
+                "Cannot save local checkpoint without initialized model state"
+            )
 
         self.checkpoint_manager.save(
             policy_model=self.policy_model,
@@ -566,7 +655,9 @@ class TrainingLoop:
         )
 
     def _notify_rewriter_reload(self) -> None:
-        rewriter_service_url = os.environ.get("REWRITER_SERVICE_URL", "http://localhost:8000")
+        rewriter_service_url = os.environ.get(
+            "REWRITER_SERVICE_URL", "http://localhost:8000"
+        )
         endpoint = f"{rewriter_service_url}/reload_checkpoint"
         try:
             requests.post(endpoint, timeout=30)
@@ -579,7 +670,9 @@ class TrainingLoop:
         self._ensure_distributed_memory_headroom()
 
         project_root = Path(__file__).resolve().parents[2]
-        script_path = project_root / "rl_loop_svc" / "scripts" / "distributed_train_once.py"
+        script_path = (
+            project_root / "rl_loop_svc" / "scripts" / "distributed_train_once.py"
+        )
         if not script_path.exists():
             raise RuntimeError(f"Distributed training script not found: {script_path}")
 
@@ -641,10 +734,12 @@ class TrainingLoop:
             )
 
             if completed.returncode != 0:
-                artifacts_dir, copied_error_files = self._persist_distributed_failure_artifacts(
-                    tmp_dir_path,
-                    completed.stdout or "",
-                    completed.stderr or "",
+                artifacts_dir, copied_error_files = (
+                    self._persist_distributed_failure_artifacts(
+                        tmp_dir_path,
+                        completed.stdout or "",
+                        completed.stderr or "",
+                    )
                 )
                 stdout_tail = (completed.stdout or "")[-4000:]
                 stderr_tail = (completed.stderr or "")[-4000:]
@@ -661,7 +756,9 @@ class TrainingLoop:
 
             result = json.loads(result_path.read_text(encoding="utf-8"))
             if not result.get("ok", False):
-                raise RuntimeError(f"Distributed PPO failed: {result.get('error', 'unknown error')}")
+                raise RuntimeError(
+                    f"Distributed PPO failed: {result.get('error', 'unknown error')}"
+                )
 
             logger.info(
                 "distributed_train_complete | step=%s | loss=%s | kl=%s",
@@ -718,7 +815,9 @@ class TrainingLoop:
 
         torchrun_log_dir = tmp_dir_path / "torchrun_logs"
         if torchrun_log_dir.exists():
-            shutil.copytree(torchrun_log_dir, artifact_dir / "torchrun_logs", dirs_exist_ok=True)
+            shutil.copytree(
+                torchrun_log_dir, artifact_dir / "torchrun_logs", dirs_exist_ok=True
+            )
             for idx, source in enumerate(sorted(torchrun_log_dir.rglob("error.json"))):
                 destination = artifact_dir / f"torchrun_error_{idx}_{source.name}"
                 try:
@@ -785,8 +884,8 @@ class TrainingLoop:
         per_gpu_free = []
         for index in range(required):
             free_bytes, total_bytes = torch.cuda.mem_get_info(index)
-            free_gb = free_bytes / (1024 ** 3)
-            total_gb = total_bytes / (1024 ** 3)
+            free_gb = free_bytes / (1024**3)
+            total_gb = total_bytes / (1024**3)
             per_gpu_free.append((index, free_gb, total_gb))
             if free_gb < settings.distributed_min_free_vram_gb_per_gpu:
                 raise RuntimeError(
@@ -821,6 +920,6 @@ class TrainingLoop:
                 kib = float(parts[1])
             except ValueError:
                 break
-            return kib / (1024 ** 2)
+            return kib / (1024**2)
 
         return 0.0

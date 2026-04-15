@@ -1,34 +1,28 @@
-import json
 import logging
-import re
-import threading
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..rl.lifecycle_manager import TrainerState
+from ..storage.trajectory_store_client import TrajectoryStoreClient
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _training_loop = None
-_rollouts_dir: Optional[Path] = None
-_seen_rollout_ids: set[str] = set()
-_seen_rollout_ids_index: Optional[Path] = None
-_rollout_lock = threading.Lock()
+_traj_client: Optional[TrajectoryStoreClient] = None
 
 
-def set_training_loop(loop, rollouts_dir: Path) -> None:
-    global _training_loop, _rollouts_dir, _seen_rollout_ids, _seen_rollout_ids_index
+def set_training_loop(
+    loop, rollouts_dir=None
+) -> None:  # rollouts_dir kept for backward compat
+    global _training_loop, _traj_client
     _training_loop = loop
-    _rollouts_dir = rollouts_dir
-    _seen_rollout_ids_index = _rollouts_dir / ".seen_rollout_ids"
-    _seen_rollout_ids = _load_seen_rollout_ids()
+    _traj_client = TrajectoryStoreClient(base_url=settings.trajectory_store_url)
 
 
 class StatusResponse(BaseModel):
@@ -41,6 +35,7 @@ class StatusResponse(BaseModel):
     last_train_error: Optional[str] = None
     last_train_started_at: Optional[str] = None
     last_train_finished_at: Optional[str] = None
+    trajectory_store_healthy: Optional[bool] = None
 
 
 class TrainResponse(BaseModel):
@@ -51,114 +46,6 @@ class TrainResponse(BaseModel):
 class CheckpointResponse(BaseModel):
     available: bool
     metadata: Optional[Dict[str, Any]] = None
-
-
-class RolloutSubmission(BaseModel):
-    rollout_id: Optional[str] = None
-    run_id: Optional[str] = None
-    group_id: Optional[str] = None
-    original_prompt: str
-    rewritten_prompt: str
-    reward: float = Field(..., ge=-1.0, le=1.0)
-    concept_reward: Optional[float] = Field(default=None, ge=-1.0, le=1.0)
-    sample_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    log_prob_old: float
-    value_estimate: Optional[float] = None
-
-
-class RolloutBatchSubmission(BaseModel):
-    run_id: Optional[str] = None
-    rollouts: List[RolloutSubmission] = Field(..., min_length=1)
-
-
-class RolloutAck(BaseModel):
-    accepted: bool
-    file_path: str
-    accepted_count: int = 0
-    duplicate_count: int = 0
-    run_id: Optional[str] = None
-
-
-def _load_seen_rollout_ids() -> set[str]:
-    if _seen_rollout_ids_index is None or not _seen_rollout_ids_index.exists():
-        return set()
-
-    try:
-        lines = _seen_rollout_ids_index.read_text(encoding="utf-8").splitlines()
-        return {line.strip() for line in lines if line.strip()}
-    except Exception:
-        return set()
-
-
-def _persist_seen_rollout_ids() -> None:
-    if _seen_rollout_ids_index is None:
-        return
-    _seen_rollout_ids_index.write_text(
-        "\n".join(sorted(_seen_rollout_ids)),
-        encoding="utf-8",
-    )
-
-
-def _sanitize_run_id(run_id: Optional[str]) -> str:
-    candidate = str(run_id or "default").strip()
-    if not candidate:
-        candidate = "default"
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", candidate)
-
-
-def _persist_rollout_batch(submissions: List[RolloutSubmission], run_id: Optional[str]) -> RolloutAck:
-    if _rollouts_dir is None:
-        raise HTTPException(status_code=503, detail="Rollout directory not configured")
-
-    _rollouts_dir.mkdir(parents=True, exist_ok=True)
-
-    resolved_run_id = _sanitize_run_id(run_id or submissions[0].run_id)
-    accepted_rollouts: List[Dict[str, Any]] = []
-    duplicate_count = 0
-
-    with _rollout_lock:
-        for submission in submissions:
-            rollout_id = (submission.rollout_id or "").strip()
-            if rollout_id:
-                if rollout_id in _seen_rollout_ids:
-                    duplicate_count += 1
-                    continue
-                _seen_rollout_ids.add(rollout_id)
-
-            row = submission.model_dump(exclude_none=True)
-            row["run_id"] = resolved_run_id
-            accepted_rollouts.append(row)
-
-        if accepted_rollouts:
-            _persist_seen_rollout_ids()
-
-    if not accepted_rollouts:
-        return RolloutAck(
-            accepted=True,
-            file_path="",
-            accepted_count=0,
-            duplicate_count=duplicate_count,
-            run_id=resolved_run_id,
-        )
-
-    payload = {
-        "run_id": resolved_run_id,
-        "rollouts": accepted_rollouts,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "batch_id": uuid4().hex,
-    }
-
-    segment_path = _rollouts_dir / f"rollout_segment_{resolved_run_id}.jsonl"
-    with segment_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
-
-    return RolloutAck(
-        accepted=True,
-        file_path=str(segment_path),
-        accepted_count=len(accepted_rollouts),
-        duplicate_count=duplicate_count,
-        run_id=resolved_run_id,
-    )
 
 
 def _background_train() -> None:
@@ -186,6 +73,8 @@ def get_status() -> StatusResponse:
     if _training_loop is None:
         raise HTTPException(status_code=503, detail="Training loop not initialised")
 
+    traj_healthy = _traj_client.is_healthy() if _traj_client is not None else None
+
     return StatusResponse(
         trainer_state=_training_loop.lifecycle.state.value,
         rollouts_loaded=_training_loop.rollouts_loaded,
@@ -194,6 +83,7 @@ def get_status() -> StatusResponse:
         kl_divergence=_training_loop.kl_controller.last_kl,
         last_train_success=_training_loop.last_train_success,
         last_train_error=_training_loop.last_train_error,
+        trajectory_store_healthy=traj_healthy,
         last_train_started_at=_training_loop.last_train_started_at,
         last_train_finished_at=_training_loop.last_train_finished_at,
     )
@@ -223,42 +113,3 @@ def get_checkpoint() -> CheckpointResponse:
     if meta is None:
         return CheckpointResponse(available=False)
     return CheckpointResponse(available=True, metadata=meta)
-
-
-@router.post("/rollout", response_model=RolloutAck)
-def submit_rollout(submission: RolloutSubmission) -> RolloutAck:
-    return _persist_rollout_batch([submission], submission.run_id)
-
-
-@router.post("/rollout_batch", response_model=RolloutAck)
-def submit_rollout_batch(submission: RolloutBatchSubmission) -> RolloutAck:
-    return _persist_rollout_batch(submission.rollouts, submission.run_id)
-
-
-class RewardServiceRollout(BaseModel):
-    """Schema matching reward_metrics_svc rollout payload (spec S16)."""
-    note_id: str
-    state: str
-    action: str
-    reward: float
-    log_prob_old: float
-    value_estimate: float = 0.0
-
-
-@router.post("/ingest_rollout", response_model=RolloutAck)
-def ingest_rollout(payload: RewardServiceRollout) -> RolloutAck:
-    """Accept rollout from reward_metrics_svc and map to internal schema.
-
-    Rollouts with empty state or action (e.g. from val/test evaluation calls)
-    are discarded to prevent training data pollution.
-    """
-    if not payload.state.strip() or not payload.action.strip():
-        return RolloutAck(accepted=False, file_path="", accepted_count=0, duplicate_count=0)
-    mapped = RolloutSubmission(
-        original_prompt=payload.state,
-        rewritten_prompt=payload.action,
-        reward=max(-1.0, min(1.0, payload.reward)),
-        log_prob_old=payload.log_prob_old,
-        value_estimate=payload.value_estimate,
-    )
-    return _persist_rollout_batch([mapped], None)

@@ -1,6 +1,7 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -63,6 +64,14 @@ class Settings(BaseSettings):
     ppo_debug_disable_rollout_filters: bool = False
 
     poll_interval_seconds: float = 5.0
+
+    # trajectory_store_svc integration
+    # When set, the RolloutLoader will also poll this directory for rollout JSONL
+    # files written by trajectory_store_svc (i.e. its rollouts_store/ output).
+    trajectory_store_rollouts_dir: Optional[Path] = None
+    # Base URL of the trajectory_store_svc HTTP service.  Used by the status
+    # endpoint to surface trajectory store health alongside training state.
+    trajectory_store_url: str = "http://localhost:8200"
 
 
 settings = Settings()

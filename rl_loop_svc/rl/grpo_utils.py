@@ -3,40 +3,19 @@ Shared GRPO (Group Relative Policy Optimization) utilities.
 
 Used by both the local training loop and the distributed training script
 to avoid logic duplication.
+
+NOTE: resolve_group_id and resolve_sample_weight have been removed — these
+preprocessing steps are now performed upstream by trajectory_store_svc
+(processing/preprocessing.py) before rollouts reach this service.
 """
 
-import hashlib
 import math
 from collections import Counter
 from typing import List
 
 import torch
 
-from ..schemas.rollout_schema import RolloutEntry
 from .rollout_buffer import RolloutBatch
-
-
-def resolve_group_id(entry: RolloutEntry) -> str:
-    if entry.group_id:
-        return str(entry.group_id)
-    base = str(entry.original_prompt or "")
-    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-    return f"g_{digest}"
-
-
-def resolve_sample_weight(entry: RolloutEntry) -> float:
-    if entry.sample_weight is None:
-        return 1.0
-
-    try:
-        weight = float(entry.sample_weight)
-    except (TypeError, ValueError):
-        return 1.0
-
-    if not math.isfinite(weight):
-        return 1.0
-
-    return float(min(max(weight, 0.0), 1.0))
 
 
 def compute_grpo_relative_rewards(
@@ -133,7 +112,9 @@ def select_rollout_batch(batch: RolloutBatch, keep_idx: torch.Tensor) -> Rollout
     )
 
 
-def build_repeated_index(size: int, target_size: int, device: torch.device) -> torch.Tensor:
+def build_repeated_index(
+    size: int, target_size: int, device: torch.device
+) -> torch.Tensor:
     if size <= 0:
         return torch.zeros((0,), dtype=torch.long, device=device)
     if size >= target_size:

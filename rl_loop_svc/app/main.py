@@ -49,7 +49,7 @@ def _log_gpu_inventory() -> None:
     logger.info("gpu_inventory | cuda_available=true | device_count=%d", count)
     for idx in range(count):
         props = torch.cuda.get_device_properties(idx)
-        total_gb = props.total_memory / (1024 ** 3)
+        total_gb = props.total_memory / (1024**3)
         logger.info(
             "gpu_device | index=%d | name=%s | total_mem_gb=%.2f",
             idx,
@@ -63,7 +63,8 @@ def _find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
         return None
 
     candidates = [
-        p for p in checkpoints_dir.iterdir()
+        p
+        for p in checkpoints_dir.iterdir()
         if p.is_dir() and p.name.startswith("checkpoint_")
     ]
     if not candidates:
@@ -118,7 +119,10 @@ async def lifespan(_: FastAPI):
         )
 
         stage_t0 = time.perf_counter()
-        rollout_loader = RolloutLoader(settings.rollouts_dir)
+        rollout_loader = RolloutLoader(
+            settings.rollouts_dir,
+            traj_store_dir=settings.trajectory_store_rollouts_dir,
+        )
         checkpoint_manager = CheckpointManager(
             checkpoints_dir=settings.checkpoints_dir,
             max_checkpoints=settings.max_checkpoints,
@@ -140,7 +144,9 @@ async def lifespan(_: FastAPI):
             from ..models.value_head import ValueHead
 
             policy_device = _resolve_device_label(settings.policy_cuda_device, "policy")
-            reference_device = _resolve_device_label(settings.reference_cuda_device, "reference")
+            reference_device = _resolve_device_label(
+                settings.reference_cuda_device, "reference"
+            )
 
             model_t0 = time.perf_counter()
             policy_model = PolicyModel(
@@ -166,11 +172,15 @@ async def lifespan(_: FastAPI):
             )
 
             model_t0 = time.perf_counter()
-            value_head = ValueHead(hidden_size=settings.hidden_size).to(policy_model.device)
+            value_head = ValueHead(hidden_size=settings.hidden_size).to(
+                policy_model.device
+            )
             if latest_ckpt is not None and load_checkpoint_weights:
                 value_head_path = latest_ckpt / "value_head.pt"
                 if value_head_path.exists():
-                    state = torch.load(value_head_path, map_location=policy_model.device)
+                    state = torch.load(
+                        value_head_path, map_location=policy_model.device
+                    )
                     value_head.load_state_dict(state)
             logger.info(
                 "startup_stage | stage=value_head_ready | elapsed_s=%.2f",

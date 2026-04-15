@@ -6,8 +6,6 @@ from .grpo_utils import (
     compute_grpo_relative_rewards,
     group_reward_std_mean,
     resolve_grpo_group_ids,
-    resolve_group_id,
-    resolve_sample_weight,
     select_rollout_batch,
 )
 from .kl_controller import KLController
@@ -24,8 +22,6 @@ __all__ = [
     "compute_grpo_relative_rewards",
     "group_reward_std_mean",
     "resolve_grpo_group_ids",
-    "resolve_group_id",
-    "resolve_sample_weight",
     "select_rollout_batch",
     "KLController",
     "PPOTrainer",
