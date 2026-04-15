@@ -11,22 +11,22 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query
 
-from dataset_svc.config import (
+from .config import (
     DEFAULT_BATCH_SIZE,
     DIAGNOSES_CSV_PATH,
     MAX_BATCH_SIZE,
     NOTES_CSV_PATH,
     validate_data_files,
 )
-from dataset_svc.logger import get_logger
-from dataset_svc.schemas import (
+from .logger import get_logger
+from .schemas import (
     BatchResponse,
     GTCodesResponse,
     HealthResponse,
     NoteIdsResponse,
     NoteResponse,
 )
-from dataset_svc.store import DatasetStore
+from .store import DatasetStore
 
 logger = get_logger(__name__)
 

@@ -4,8 +4,8 @@ from typing import List
 
 import requests
 
-from icd10_coding_svc.config import DATASET_SVC_URL, GT_CODES_PATH
-from icd10_coding_svc.logger import get_logger
+from .config import DATASET_SVC_URL, GT_CODES_PATH
+from .logger import get_logger
 
 log = get_logger("gt_fetcher")
 

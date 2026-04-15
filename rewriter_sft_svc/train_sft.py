@@ -4,10 +4,10 @@ train_sft.py — rewriter_sft_svc
 Main entry point for the SFT training pipeline.
 
 Usage:
-    python train_sft.py
-    python train_sft.py --test-only
-    python train_sft.py --epochs 3
-    python train_sft.py --dataset /workspace/data/structured_notes.csv --epochs 3
+    python -m rewriter_sft_svc.train_sft
+    python -m rewriter_sft_svc.train_sft --test-only
+    python -m rewriter_sft_svc.train_sft --epochs 3
+    python -m rewriter_sft_svc.train_sft --dataset /workspace/data/structured_notes.csv --epochs 3
 """
 
 import os
@@ -23,19 +23,17 @@ import logging
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from config import (
+from .config import (
     CHECKPOINT_DIR,
     DATASET_PATH,
     LOG_LEVEL,
     TRAIN_EPOCHS,
     TESTING_SUMMARY_PATH,
 )
-from dataset_loader import get_datasets
-from model_trainer import load_tokenizer, train
-from preprocessing import preprocess_for_training
-from test_runner import run_all_tests, generate_testing_summary
+from .dataset_loader import get_datasets
+from .model_trainer import load_tokenizer, train
+from .preprocessing import preprocess_for_training
+from .test_runner import run_all_tests, generate_testing_summary
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -106,8 +104,8 @@ def run_training_pipeline(dataset_path: str, num_epochs: int):
     logger.info(f"[8/10] Training complete in {elapsed}s — checkpoint: {checkpoint_path}")
 
     logger.info("[9/10] Running schema-based evaluation on test set …")
-    from preprocessing import validate_output_schema
-    from config import REQUIRED_FIELDS
+    from .preprocessing import validate_output_schema
+    from .config import REQUIRED_FIELDS
 
     passed = sum(
         1

@@ -8,7 +8,7 @@ Phi-3 Mini chat-style training messages and tokenizes them.
 import logging
 from typing import List, Dict, Any
 
-from config import SYSTEM_INSTRUCTION, MAX_SEQ_LENGTH
+from .config import SYSTEM_INSTRUCTION, MAX_SEQ_LENGTH
 
 logger = logging.getLogger(__name__)
 

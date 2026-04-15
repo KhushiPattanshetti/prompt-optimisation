@@ -9,7 +9,7 @@ Covers:
 
 import math
 import pytest
-from reward import compute_reward, _r_exact, _r_structure
+from reward_metrics_svc.reward import compute_reward, _r_exact, _r_structure
 
 
 # ─────────────────────────────────────────────────────────────────────────────

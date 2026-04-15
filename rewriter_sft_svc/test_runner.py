@@ -13,9 +13,9 @@ Test categories:
   7. Regression Tests
 
 Run directly:
-    python test_runner.py
+    python -m rewriter_sft_svc.test_runner
 or via:
-    python train_sft.py --test-only
+    python -m rewriter_sft_svc.train_sft --test-only
 """
 
 import json
@@ -27,10 +27,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-# Allow imports from the service directory
-sys.path.insert(0, os.path.dirname(__file__))
-
-from config import (
+from .config import (
     CHECKPOINT_DIR,
     DATASET_KEYS,
     REQUIRED_FIELDS,
@@ -38,8 +35,8 @@ from config import (
     TEST_DATA_DIR,
     TESTING_SUMMARY_PATH,
 )
-from dataset_loader import load_raw_dataset, validate_schema, split_dataset
-from preprocessing import convert_dataset, record_to_messages, validate_output_schema
+from .dataset_loader import load_raw_dataset, validate_schema, split_dataset
+from .preprocessing import convert_dataset, record_to_messages, validate_output_schema
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")

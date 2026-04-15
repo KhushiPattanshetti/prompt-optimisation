@@ -13,11 +13,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from rl.lifecycle_manager import TrainerState
-from rl.rollout_buffer import RolloutBuffer
-from rl.training_loop import TrainingLoop
-from storage.checkpoint_manager import CheckpointManager
-from storage.rollout_loader import RolloutLoader
+from ...rl.lifecycle_manager import TrainerState
+from ...rl.rollout_buffer import RolloutBuffer
+from ...rl.training_loop import TrainingLoop
+from ...storage.checkpoint_manager import CheckpointManager
+from ...storage.rollout_loader import RolloutLoader
 
 
 # ── Stub model helpers ────────────────────────────────────────────────────────
@@ -45,11 +45,11 @@ class _StubPolicyModel(nn.Module):
 
     def forward(self, input_ids, attention_mask=None):
         B, T = input_ids.shape
-        # Route through self.linear so output has a grad_fn
-        bias = self.linear(torch.ones(B, 1)) * 0.0  # (B, 1) — keeps grad graph
+        bias = self.linear(torch.ones(B, 1)) * 0.0
         lp = torch.full((B, max(T - 1, 1)), -5.0) + bias
         hidden = torch.zeros(B, T, 16) + bias.unsqueeze(2) * 0.0
-        return lp, hidden
+        logits = torch.zeros(B, max(T - 1, 1), 32) + bias.unsqueeze(2) * 0.0
+        return lp, hidden, logits
 
     def get_sequence_log_prob(self, input_ids, attention_mask=None):
         B = input_ids.shape[0]
@@ -60,6 +60,13 @@ class _StubPolicyModel(nn.Module):
         ids = torch.ones(len(texts), 8, dtype=torch.long)
         return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
 
+    def tokenize_with_action_mask(self, original_texts, rewritten_texts):
+        B = len(original_texts)
+        ids = torch.ones(B, 8, dtype=torch.long)
+        mask = torch.ones_like(ids)
+        action_mask = torch.ones(B, 7, dtype=torch.float32)
+        return {"input_ids": ids, "attention_mask": mask, "action_mask": action_mask}
+
     def parameters(self, recurse=True):
         return self.linear.parameters(recurse)
 
@@ -68,7 +75,7 @@ class _StubPolicyModel(nn.Module):
 
 
 class _StubReferenceModel:
-    def get_sequence_log_prob(self, input_ids, attention_mask=None):
+    def get_sequence_log_prob(self, input_ids, attention_mask=None, action_mask=None):
         B = input_ids.shape[0]
         return torch.full((B,), -5.5)
 
@@ -150,7 +157,7 @@ class TestFullCycle:
         assert training_loop.lifecycle.state == TrainerState.IDLE
 
     def test_training_step_incremented(self, training_loop):
-        from app.config import settings
+        from ...app.config import settings
 
         training_loop.run_once()
         assert training_loop.training_step == settings.ppo_epochs

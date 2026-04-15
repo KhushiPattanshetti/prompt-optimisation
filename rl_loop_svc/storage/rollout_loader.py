@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-from app.config import settings
-from schemas.rollout_schema import RolloutEntry, RolloutFile
+from ..app.config import settings
+from ..schemas.rollout_schema import RolloutEntry, RolloutFile
 
 logger = logging.getLogger(__name__)
 

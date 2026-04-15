@@ -102,6 +102,7 @@ services:
     environment:
       - PYTHONPATH=/app
       - RL_BLOCK_ENDPOINT=http://rl_loop_svc:8004/rollout
+      - RL_SERVICE_URL=http://rl_loop_svc:8004/ingest_rollout
       - ROLLOUT_QUEUE_DIR=/app/reward_queue
       - ROLLOUT_REQUIRE_PARSE_COMPARABILITY=${ROLLOUT_REQUIRE_PARSE_COMPARABILITY:-true}
     healthcheck:

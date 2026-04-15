@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from rl.advantage import compute_gae
-from rl.rollout_buffer import RolloutBuffer
-from storage.rollout_loader import RolloutLoader
+from ...rl.advantage import compute_gae
+from ...rl.rollout_buffer import RolloutBuffer
+from ...storage.rollout_loader import RolloutLoader
 
 
 class TestRolloutLoaderBufferIntegration:

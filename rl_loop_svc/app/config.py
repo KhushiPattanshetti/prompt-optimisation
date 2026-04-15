@@ -37,7 +37,10 @@ class Settings(BaseSettings):
     ppo_min_effective_batch_size: int = 8
     ppo_epochs: int = 3
     learning_rate: float = 3e-5
+    lr_warmup_ratio: float = 0.1
+    lr_min_ratio: float = 0.1
     max_checkpoints: int = 5
+    ratio_clip_max: float = 10.0
 
     model_name: str = "ishanmane/phi3-rewriter-sft"
     hidden_size: int = 3072

@@ -31,7 +31,7 @@ def compute_gae(
         advantages: Tensor of shape (T,) — normalised GAE advantages.
     """
     T = rewards.shape[0]
-    advantages = torch.zeros(T, dtype=torch.float32)
+    advantages = torch.zeros(T, dtype=torch.float32, device=rewards.device)
 
     gae = 0.0
     # Bootstrap with 0 value after the last step (episode termination)

@@ -4,24 +4,20 @@ run_training.py — manual training runner script.
 Loads rollouts from the rollouts/ directory and runs one PPO cycle.
 
 Usage:
-    python scripts/run_training.py [--model gpt2] [--steps 1]
+    python -m rl_loop_svc.scripts.run_training [--model gpt2] [--steps 1]
 """
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
-# Ensure project root is on the path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from app.config import settings
-from models.policy_model import PolicyModel
-from models.reference_model import ReferenceModel
-from models.value_head import ValueHead
-from rl.training_loop import TrainingLoop
-from storage.checkpoint_manager import CheckpointManager
-from storage.rollout_loader import RolloutLoader
+from ..app.config import settings
+from ..models.policy_model import PolicyModel
+from ..models.reference_model import ReferenceModel
+from ..models.value_head import ValueHead
+from ..rl.training_loop import TrainingLoop
+from ..storage.checkpoint_manager import CheckpointManager
+from ..storage.rollout_loader import RolloutLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)

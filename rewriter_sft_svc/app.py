@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from config import (
+from .config import (
     BASE_MODEL_NAME,
     SYSTEM_INSTRUCTION,
     MAX_NEW_TOKENS,

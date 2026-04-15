@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from rl.rollout_buffer import RolloutBatch
+from .rollout_buffer import RolloutBatch
 
 
 @dataclass

@@ -12,8 +12,8 @@ distance(code_a, code_b) → float : 1 - sim ∈ [0, 1]
 import logging
 from typing import Optional
 
-import tree as _tree
-from config import VIRTUAL_ROOT
+from . import tree as _tree
+from .config import VIRTUAL_ROOT
 
 logger = logging.getLogger("reward_metrics_svc.similarity")
 

@@ -12,6 +12,7 @@ class CodeRequest(BaseModel):
     generation_source: Optional[str] = None
     log_prob_old: Optional[float] = None
     value_estimate: Optional[float] = None
+    skip_reward_forward: bool = False
 
 
 class CodeResponse(BaseModel):
@@ -22,3 +23,6 @@ class CodeResponse(BaseModel):
     enh_raw_output: str
     org_raw_output: str
     parsing_success: bool
+    enh_parse_ok: bool = False
+    org_parse_ok: bool = False
+    both_parse_success: bool = False

@@ -52,3 +52,5 @@ data/*.xlsx
 
 # Script caches
 scripts/__pycache__/
+
+.cursor/

@@ -13,7 +13,7 @@ import logging
 import statistics
 from typing import List
 
-from similarity import depth, sim
+from .similarity import depth, sim
 
 logger = logging.getLogger("reward_metrics_svc.log_utils")
 

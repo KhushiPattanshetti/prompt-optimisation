@@ -5,8 +5,8 @@ Covers: _infer_depth fallback, depth(), lca(), sim(), distance()
 """
 
 import pytest
-from similarity import depth, distance, lca, sim, _infer_depth
-from config import VIRTUAL_ROOT
+from reward_metrics_svc.similarity import depth, distance, lca, sim, _infer_depth
+from reward_metrics_svc.config import VIRTUAL_ROOT
 
 
 # ─────────────────────────────────────────────────────────────────────────────

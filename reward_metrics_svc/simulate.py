@@ -12,22 +12,16 @@ the fallback (spec §8.3, §19).
 
 Usage
 -----
-  cd reward_metrics_svc/
-  python simulate.py                          # DEBUG to stdout (default)
-  python simulate.py 2>&1 | tee run.log       # save logs to file
+  python -m reward_metrics_svc.simulate                 # DEBUG to stdout (default)
+  python -m reward_metrics_svc.simulate 2>&1 | tee run.log  # save logs to file
 
 To exercise the HTTP API instead, start the server first:
-  uvicorn app:app --host 0.0.0.0 --port 8002 --log-level debug
+  uvicorn reward_metrics_svc.app:app --host 0.0.0.0 --port 8002 --log-level debug
 
 Then use the curl examples printed at the end of this script.
 """
 
 import logging
-import os
-import sys
-
-# ── make reward_metrics_svc/ importable when running from any directory ───────
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── configure logging BEFORE any project import (captures tree-build logs) ───
 logging.basicConfig(
@@ -37,8 +31,8 @@ logging.basicConfig(
 )
 
 # ── project imports (after logging setup) ─────────────────────────────────────
-from log_utils import log_coverage_debug, log_extra_debug, update_aggregate_stats
-from reward import compute_reward
+from .log_utils import log_coverage_debug, log_extra_debug, update_aggregate_stats
+from .reward import compute_reward
 
 logger = logging.getLogger("simulate")
 
@@ -303,7 +297,9 @@ def run() -> None:
     logger.info("  1. Start the server:")
     logger.info("       cd reward_metrics_svc/")
     logger.info("       source .venv/bin/activate")
-    logger.info("       uvicorn app:app --host 0.0.0.0 --port 8002 --log-level debug")
+    logger.info(
+        "       uvicorn reward_metrics_svc.app:app --host 0.0.0.0 --port 8002 --log-level debug"
+    )
     logger.info("")
     logger.info("  2. Health check:")
     logger.info("       curl http://localhost:8002/health")

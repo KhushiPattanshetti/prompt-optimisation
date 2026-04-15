@@ -7,10 +7,8 @@ from pathlib import Path
 import torch
 from fastapi import FastAPI
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from app.api_routes import router, set_training_loop
-from app.config import settings
+from .api_routes import router, set_training_loop
+from .config import settings
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -95,9 +93,9 @@ async def lifespan(_: FastAPI):
         if settings.startup_log_gpu_inventory:
             _log_gpu_inventory()
 
-        from rl.training_loop import TrainingLoop
-        from storage.checkpoint_manager import CheckpointManager
-        from storage.rollout_loader import RolloutLoader
+        from ..rl.training_loop import TrainingLoop
+        from ..storage.checkpoint_manager import CheckpointManager
+        from ..storage.rollout_loader import RolloutLoader
 
         stage_t0 = time.perf_counter()
         latest_ckpt = _find_latest_checkpoint(settings.checkpoints_dir)
@@ -137,9 +135,9 @@ async def lifespan(_: FastAPI):
             policy_device = "distributed"
             reference_device = "distributed"
         else:
-            from models.policy_model import PolicyModel
-            from models.reference_model import ReferenceModel
-            from models.value_head import ValueHead
+            from ..models.policy_model import PolicyModel
+            from ..models.reference_model import ReferenceModel
+            from ..models.value_head import ValueHead
 
             policy_device = _resolve_device_label(settings.policy_cuda_device, "policy")
             reference_device = _resolve_device_label(settings.reference_cuda_device, "reference")

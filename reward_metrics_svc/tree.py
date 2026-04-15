@@ -16,7 +16,7 @@ import logging
 from collections import deque
 from typing import Any, Dict, List, Tuple
 
-from config import ICD10_TREE_PATH, VIRTUAL_ROOT
+from .config import ICD10_TREE_PATH, VIRTUAL_ROOT
 
 logger = logging.getLogger("reward_metrics_svc.tree")
 

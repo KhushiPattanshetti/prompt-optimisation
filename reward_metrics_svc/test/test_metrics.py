@@ -6,7 +6,7 @@ Covers: set_distance, coverage_penalty, extra_penalty,
 """
 
 import pytest
-from metrics import (
+from reward_metrics_svc.metrics import (
     cardinality_penalty,
     coverage_penalty,
     distance_between,
@@ -14,7 +14,7 @@ from metrics import (
     extra_penalty,
     set_distance,
 )
-from config import LAMBDA_CARD, LAMBDA_EXTRA
+from reward_metrics_svc.config import LAMBDA_CARD, LAMBDA_EXTRA
 
 
 # ─────────────────────────────────────────────────────────────────────────────

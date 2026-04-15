@@ -12,23 +12,30 @@ from typing import List, Dict, Any, Tuple
 
 import pandas as pd
 
-from config import DATASET_PATH, DATASET_KEYS, VALIDATION_SPLIT, TEST_SPLIT
+from .config import DATASET_PATH, DATASET_KEYS, VALIDATION_SPLIT, TEST_SPLIT
 
 logger = logging.getLogger(__name__)
 
 
 def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert CSV column names to internal schema
+    Convert CSV column names to internal schema.
+    Handles both naming conventions:
+      - original_note / optimized_note
+      - clinical note / structured clinical note
     """
 
     normalized = {}
 
     if "original_note" in record:
         normalized["clinical note"] = record["original_note"]
+    elif "clinical note" in record:
+        normalized["clinical note"] = record["clinical note"]
 
     if "optimized_note" in record:
         normalized["structured clinical note"] = record["optimized_note"]
+    elif "structured clinical note" in record:
+        normalized["structured clinical note"] = record["structured clinical note"]
 
     return normalized
 

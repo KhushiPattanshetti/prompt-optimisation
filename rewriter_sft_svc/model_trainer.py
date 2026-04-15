@@ -19,7 +19,7 @@ from transformers import (
 )
 from trl import SFTTrainer, SFTConfig
 
-from config import (
+from .config import (
     BASE_MODEL_NAME,
     CHECKPOINT_DIR,
     LORA_R,

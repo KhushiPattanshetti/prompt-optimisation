@@ -14,9 +14,9 @@ distance_with_components(gt, pred) → (float, dict)   (scalar + breakdown)
 import logging
 from typing import Dict, List, Tuple
 
-import tree as _tree
-from config import ALPHA, BETA, GAMMA, DELTA, WEIGHT_SUM, LAMBDA_EXTRA, LAMBDA_CARD
-from similarity import depth, sim, distance
+from . import tree as _tree
+from .config import ALPHA, BETA, GAMMA, DELTA, WEIGHT_SUM, LAMBDA_EXTRA, LAMBDA_CARD
+from .similarity import depth, sim, distance
 
 logger = logging.getLogger("reward_metrics_svc.metrics")
 

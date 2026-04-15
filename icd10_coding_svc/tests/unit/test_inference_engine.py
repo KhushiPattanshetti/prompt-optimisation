@@ -190,8 +190,10 @@ class TestParseRecoveryAndGroupPropagation:
         assert result["both_parse_success"] is True
 
         forwarded_payload = mock_fwd.call_args.args[0]
-        assert forwarded_payload["group_id"] == "g-test-1"
-        assert forwarded_payload["org_parse_ok"] is True
+        assert forwarded_payload["note_id"] == "12345"
+        assert forwarded_payload["parsing_success"] is True
+        assert "state" in forwarded_payload
+        assert "action" in forwarded_payload
 
         files = list(tmp_path.iterdir())
         assert len(files) == 1

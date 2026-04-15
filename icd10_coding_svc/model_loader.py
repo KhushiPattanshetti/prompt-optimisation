@@ -23,8 +23,8 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from icd10_coding_svc.config import MODEL_NAME, LOCAL_CACHE_PATH
-from icd10_coding_svc.logger import get_logger
+from .config import MODEL_NAME, LOCAL_CACHE_PATH
+from .logger import get_logger
 
 log = get_logger("model_loader")
 

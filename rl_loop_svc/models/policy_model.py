@@ -98,7 +98,7 @@ class PolicyModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -113,14 +113,14 @@ class PolicyModel(nn.Module):
         ).squeeze(-1)
 
         last_hidden_states = outputs.hidden_states[-1]
-        return token_log_probs, last_hidden_states
+        return token_log_probs, last_hidden_states, logits
 
     def get_sequence_log_prob(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        token_log_probs, _ = self.forward(input_ids, attention_mask)
+        token_log_probs, _, _ = self.forward(input_ids, attention_mask)
         return token_log_probs.sum(dim=-1)
 
     def tokenize(self, texts: list[str]) -> dict[str, torch.Tensor]:

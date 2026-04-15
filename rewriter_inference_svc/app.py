@@ -7,12 +7,13 @@ Endpoint:
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from rewriter_inference_svc.config import MODEL_NAME
-from rewriter_inference_svc.inference_engine import run_inference
-from rewriter_inference_svc.logger import get_logger
-from rewriter_inference_svc.model_loader import get_cached_model, load_model
-from rewriter_inference_svc.schemas import RewriteRequest, RewriteResponse
+from .config import MODEL_NAME
+from .inference_engine import run_inference, update_best_prompt_cache
+from .logger import get_logger
+from .model_loader import get_cached_model, load_model, reload_from_latest_checkpoint
+from .schemas import RewriteRequest, RewriteResponse
 
 log = get_logger(__name__)
 
@@ -57,20 +58,22 @@ def rewrite_prompt(request: RewriteRequest) -> RewriteResponse:
 
 @app.post("/reload_checkpoint")
 def reload_checkpoint():
-    from rewriter_inference_svc.model_loader import reload_from_latest_checkpoint
-
     reload_from_latest_checkpoint()
     return {"status": "reloaded"}
 
 
-@app.post("/update_best_prompt")
-def update_best_prompt(payload: dict):
-    from rewriter_inference_svc.inference_engine import update_best_prompt_cache
+class UpdateBestPromptRequest(BaseModel):
+    note_id: str
+    rewritten_prompt: str
+    reward: float
 
+
+@app.post("/update_best_prompt")
+def update_best_prompt(payload: UpdateBestPromptRequest):
     update_best_prompt_cache(
-        payload["note_id"],
-        payload["rewritten_prompt"],
-        payload["reward"],
+        payload.note_id,
+        payload.rewritten_prompt,
+        payload.reward,
     )
     return {"status": "updated"}
 

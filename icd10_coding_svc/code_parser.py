@@ -2,8 +2,8 @@ import json
 import re
 from typing import List, Optional
 
-from icd10_coding_svc.config import ICD10_REGEX_PATTERN
-from icd10_coding_svc.logger import get_logger
+from .config import ICD10_REGEX_PATTERN
+from .logger import get_logger
 
 log = get_logger("code_parser")
 

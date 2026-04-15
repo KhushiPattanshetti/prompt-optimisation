@@ -1,21 +1,9 @@
-"""
-conftest.py – Shared pytest fixtures for reward_metrics_svc tests.
-
-Inserts the service root into sys.path so test files can import
-config, tree, similarity, metrics, reward, log_utils, schemas, app
-without any per-file path manipulation.
-"""
-
-import os
-import sys
+"""conftest.py – Shared pytest fixtures for reward_metrics_svc tests."""
 
 import pytest
 from fastapi.testclient import TestClient
 
-# Make the reward_metrics_svc/ directory importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app import app  # noqa: E402
+from reward_metrics_svc.app import app
 
 
 @pytest.fixture(scope="session")

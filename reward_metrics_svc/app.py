@@ -13,13 +13,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-import tree as _tree
-from config import ALPHA, BETA, GAMMA, DELTA, LAMBDA_EXTRA, LAMBDA_CARD
-from config import W_TREE, W_EXACT, W_STRUCTURE
-from log_utils import log_coverage_debug, log_extra_debug, update_aggregate_stats
-from reward import compute_reward
-from rollout import enqueue_rollout
-from schemas import (
+from . import tree as _tree
+from .config import ALPHA, BETA, GAMMA, DELTA, LAMBDA_EXTRA, LAMBDA_CARD
+from .config import W_TREE, W_EXACT, W_STRUCTURE
+from .log_utils import log_coverage_debug, log_extra_debug, update_aggregate_stats
+from .reward import compute_reward
+from .rollout import enqueue_rollout
+from .schemas import (
     ComponentMetrics,
     Diagnostics,
     HealthResponse,

@@ -9,8 +9,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from rl.ppo_trainer import PPOTrainer
-from rl.rollout_buffer import RolloutBatch
+from ...rl.ppo_trainer import PPOTrainer
+from ...rl.rollout_buffer import RolloutBatch
 
 
 def _make_batch(size: int = 4) -> RolloutBatch:

@@ -61,17 +61,17 @@ pip install -r requirements.txt
 
 ```bash
 # HTTP server (port 8002)
-uvicorn app:app --host 0.0.0.0 --port 8002 --log-level debug
+uvicorn reward_metrics_svc.app:app --host 0.0.0.0 --port 8002 --log-level debug
 
 # Or via the entry point
-python main.py
+python -m reward_metrics_svc.main
 ```
 
 ## Standalone Simulation (logs without a server)
 
 ```bash
-python simulate.py                     # DEBUG logs to stdout
-python simulate.py 2>&1 | tee run.log  # save to file
+python -m reward_metrics_svc.simulate                     # DEBUG logs to stdout
+python -m reward_metrics_svc.simulate 2>&1 | tee run.log  # save to file
 ```
 
 Runs all 14+1 spec §19 scenarios directly against the Python functions, emitting full `DEBUG`-level traces for every LCA, similarity, penalty, and reward computation.

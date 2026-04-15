@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-from config import RL_SERVICE_URL, ROLLOUT_DIR
+from .config import RL_SERVICE_URL, ROLLOUT_DIR
 
 logger = logging.getLogger("reward_metrics_svc.rollout")
 

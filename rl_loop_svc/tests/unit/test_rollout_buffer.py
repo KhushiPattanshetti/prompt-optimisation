@@ -5,7 +5,7 @@ Unit tests: RolloutBuffer
 import pytest
 import torch
 
-from rl.rollout_buffer import RolloutBuffer
+from ...rl.rollout_buffer import RolloutBuffer
 
 
 class TestRolloutBuffer:

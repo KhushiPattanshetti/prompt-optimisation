@@ -1,136 +1,62 @@
 import logging
 import json
-import os
-import hashlib
 import math
+import os
 import re
 import shutil
-from collections import Counter
-from datetime import datetime, timezone
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 import requests
 import torch
+import torch.nn.functional as F
 
-from app.config import settings
-from models.policy_model import PolicyModel
-from models.reference_model import ReferenceModel
-from models.value_head import ValueHead
-from rl.advantage import compute_gae
-from rl.kl_controller import KLController
-from rl.lifecycle_manager import LifecycleManager, TrainerState
-from rl.ppo_trainer import PPOTrainer
-from rl.rollout_buffer import RolloutBatch, RolloutBuffer
-from schemas.rollout_schema import RolloutEntry
-from storage.checkpoint_manager import CheckpointManager
-from storage.rollout_loader import RolloutLoader
+from ..app.config import settings
+from ..models.policy_model import PolicyModel
+from ..models.reference_model import ReferenceModel
+from ..models.value_head import ValueHead
+from .advantage import compute_gae
+from .grpo_utils import (
+    build_grpo_fallback_mask,
+    build_repeated_index,
+    compute_grpo_relative_rewards,
+    group_reward_std_mean,
+    resolve_grpo_group_ids,
+    resolve_group_id,
+    resolve_sample_weight,
+    select_rollout_batch,
+)
+from .kl_controller import KLController
+from .lifecycle_manager import LifecycleManager, TrainerState
+from .rollout_buffer import RolloutBatch, RolloutBuffer
+from ..schemas.rollout_schema import RolloutEntry
+from ..storage.checkpoint_manager import CheckpointManager
+from ..storage.rollout_loader import RolloutLoader
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_group_id(entry: RolloutEntry) -> str:
-    if entry.group_id:
-        return str(entry.group_id)
-    base = str(entry.original_prompt or "")
-    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-    return f"g_{digest}"
+def _select_optional_tensor(
+    tensor: Optional[torch.Tensor],
+    keep_idx: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    return tensor[keep_idx]
 
 
-def _resolve_sample_weight(entry: RolloutEntry) -> float:
-    if entry.sample_weight is None:
-        return 1.0
-
-    try:
-        weight = float(entry.sample_weight)
-    except (TypeError, ValueError):
-        return 1.0
-
-    if not math.isfinite(weight):
-        return 1.0
-
-    return float(min(max(weight, 0.0), 1.0))
-
-
-def _compute_grpo_relative_rewards(
-    rewards: torch.Tensor,
-    group_ids: List[str],
-    min_group_size: int,
+def _fuse_action_attention_mask(
+    action_mask: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if rewards.numel() == 0:
-        return rewards
-
-    relative = torch.zeros_like(rewards)
-    grouped: dict[str, List[int]] = {}
-    for idx, group_id in enumerate(group_ids):
-        grouped.setdefault(str(group_id), []).append(idx)
-
-    for indices in grouped.values():
-        if len(indices) < max(min_group_size, 2):
-            continue
-        idx_tensor = torch.tensor(indices, dtype=torch.long, device=rewards.device)
-        group_rewards = rewards[idx_tensor]
-        group_mean = group_rewards.mean()
-        group_std = group_rewards.std(unbiased=False) + 1e-6
-        relative[idx_tensor] = (group_rewards - group_mean) / group_std
-
-    return relative
-
-
-def _resolve_grpo_group_ids(
-    group_ids: List[str],
-    min_group_size: int,
-    fallback_group_size: int,
-) -> List[str]:
-    """Ensure GRPO has usable groups by backfilling deterministic K-sized groups when needed."""
-    normalized = [str(group_id) for group_id in group_ids]
-    if not normalized:
-        return normalized
-
-    threshold = max(int(min_group_size), 2)
-    counts = Counter(normalized)
-    if any(size >= threshold for size in counts.values()):
-        return normalized
-
-    group_size = max(int(fallback_group_size), threshold)
-    return [f"grpo_auto_{idx // group_size}" for idx in range(len(normalized))]
-
-
-def _build_grpo_fallback_mask(
-    group_ids: List[str],
-    min_group_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    threshold = max(int(min_group_size), 2)
-    counts = Counter(str(group_id) for group_id in group_ids)
-    mask = [counts.get(str(group_id), 0) < threshold for group_id in group_ids]
-    return torch.tensor(mask, dtype=torch.bool, device=device)
-
-
-def _group_reward_std_mean(
-    rewards: torch.Tensor,
-    group_ids: List[str],
-    min_group_size: int,
-) -> float:
-    threshold = max(int(min_group_size), 2)
-    grouped: dict[str, List[int]] = {}
-    for idx, group_id in enumerate(group_ids):
-        grouped.setdefault(str(group_id), []).append(idx)
-
-    std_values: List[float] = []
-    for indices in grouped.values():
-        if len(indices) < threshold:
-            continue
-        idx_tensor = torch.tensor(indices, dtype=torch.long, device=rewards.device)
-        group_std = rewards[idx_tensor].std(unbiased=False)
-        std_values.append(float(group_std.item()))
-
-    if not std_values:
-        return 0.0
-    return float(sum(std_values) / len(std_values))
+    """Combine action_mask with attention_mask so padding tokens are excluded."""
+    if attention_mask is None:
+        return action_mask
+    return action_mask * attention_mask[:, 1:].to(dtype=action_mask.dtype)
 
 
 class TrainingLoop:
@@ -168,6 +94,7 @@ class TrainingLoop:
         else:
             self.optimizer = None
 
+        self.scheduler = None
         self.training_step = 0
         self.last_loss = 0.0
         self.rollouts_loaded = 0
@@ -214,6 +141,440 @@ class TrainingLoop:
         self.buffer.clear()
         return True
 
+    # ── Buffer fill with ValueHead inference ────────────────────────────────
+
+    def _fill_buffer(self, entries: List[RolloutEntry]) -> None:
+        self.buffer.clear()
+
+        originals = [e.original_prompt for e in entries]
+        rewrittens = [e.rewritten_prompt for e in entries]
+
+        value_estimates = self._compute_value_estimates(originals)
+
+        for idx, entry in enumerate(entries):
+            concept_reward = (
+                float(entry.concept_reward)
+                if entry.concept_reward is not None
+                else float(entry.reward)
+            )
+            self.buffer.store(
+                reward=entry.reward,
+                log_prob_old=entry.log_prob_old,
+                value_estimate=value_estimates[idx],
+                original_prompt=entry.original_prompt,
+                rewritten_prompt=entry.rewritten_prompt,
+                concept_reward=concept_reward,
+                group_id=resolve_group_id(entry),
+                sample_weight=resolve_sample_weight(entry),
+            )
+
+    def _compute_value_estimates(self, prompts: List[str]) -> List[float]:
+        """Run ValueHead on original prompts to produce V(s) estimates."""
+        if self.value_head is None or self.policy_model is None:
+            return [0.0] * len(prompts)
+
+        estimates: List[float] = []
+        self.value_head.eval()
+        with torch.no_grad():
+            for start in range(0, len(prompts), settings.batch_size):
+                batch_texts = prompts[start : start + settings.batch_size]
+                encoded = self.policy_model.tokenize(batch_texts)
+                _, hidden_states, _ = self.policy_model(
+                    encoded["input_ids"],
+                    encoded.get("attention_mask"),
+                )
+                values = self.value_head(hidden_states)
+                estimates.extend(values.detach().cpu().tolist())
+        self.value_head.train()
+        return estimates
+
+    # ── Core GRPO/PPO training ──────────────────────────────────────────────
+
+    def _run_ppo_epochs(self) -> None:
+        if self.policy_model is None or self.reference_model is None:
+            raise RuntimeError("Local GRPO run requested without initialized model components")
+        if self.optimizer is None:
+            raise RuntimeError("Local GRPO run requested without optimizer")
+
+        final_rewards = torch.tensor(self.buffer._rewards, dtype=torch.float32)
+        concept_rewards = torch.tensor(self.buffer._concept_rewards, dtype=torch.float32)
+        rewards = (
+            settings.final_reward_beta * final_rewards
+            + settings.concept_reward_alpha * concept_rewards
+        )
+
+        effective_group_ids = resolve_grpo_group_ids(
+            self.buffer._group_ids,
+            settings.grpo_min_group_size,
+            settings.grpo_group_size,
+        )
+        if effective_group_ids != self.buffer._group_ids:
+            logger.info(
+                "grpo_group_fallback_applied | source_groups=%d | fallback_group_size=%d",
+                len(set(self.buffer._group_ids)),
+                settings.grpo_group_size,
+            )
+
+        # GRPO within-group advantages (no global normalization to preserve group signal)
+        grpo_advantages = compute_grpo_relative_rewards(
+            rewards,
+            effective_group_ids,
+            settings.grpo_min_group_size,
+        )
+
+        # Fallback for samples in groups too small for GRPO
+        fallback_advantages = rewards.clone()
+        if fallback_advantages.numel() > 1:
+            fallback_advantages = (
+                fallback_advantages - fallback_advantages.mean()
+            ) / (fallback_advantages.std(unbiased=False) + 1e-6)
+
+        fallback_mask_base = build_grpo_fallback_mask(
+            effective_group_ids,
+            settings.grpo_min_group_size,
+            device=grpo_advantages.device,
+        )
+        pure_reward_advantages = torch.where(fallback_mask_base, fallback_advantages, grpo_advantages)
+
+        # Blend with GAE advantages from ValueHead when available
+        values_tensor = torch.tensor(self.buffer._values, dtype=torch.float32)
+        has_value_estimates = values_tensor.abs().sum().item() > 0
+        if has_value_estimates:
+            gae_advantages = compute_gae(
+                rewards,
+                values_tensor,
+                gamma=settings.gamma,
+                lam=settings.lam,
+                normalize=True,
+            )
+            lam_h = settings.hybrid_advantage_lambda
+            advantages = lam_h * gae_advantages + (1.0 - lam_h) * pure_reward_advantages
+        else:
+            advantages = pure_reward_advantages
+
+        group_reward_std = group_reward_std_mean(
+            rewards,
+            effective_group_ids,
+            settings.grpo_min_group_size,
+        )
+        logger.info(
+            "grpo_advantage_diag | rewards_mean=%.6f | group_reward_std=%.6f | advantage_mean=%.6f | advantage_std=%.6f | fallback_samples=%d | gae_blended=%s",
+            float(rewards.mean().item()) if rewards.numel() else 0.0,
+            group_reward_std,
+            float(advantages.mean().item()) if advantages.numel() else 0.0,
+            float(advantages.std(unbiased=False).item()) if advantages.numel() > 1 else 0.0,
+            int(fallback_mask_base.sum().item()),
+            has_value_estimates,
+        )
+
+        batch = self.buffer.build(advantages)
+        loaded_batch_size = len(batch.rewritten_prompts)
+        if loaded_batch_size == 0:
+            return
+
+        min_effective_batch_size = max(int(settings.ppo_min_effective_batch_size), 1)
+
+        # ── Hoist: tokenize once ────────────────────────────────────────────
+        tokenized = self.policy_model.tokenize_with_action_mask(
+            batch.original_prompts,
+            batch.rewritten_prompts,
+        )
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized.get("attention_mask")
+        action_mask = tokenized["action_mask"]
+        valid_action = tokenized.get("valid_action")
+
+        # Fuse action_mask with attention_mask once for consistent use
+        fused_action_mask = _fuse_action_attention_mask(action_mask, attention_mask)
+
+        # ── Hoist: filter once ──────────────────────────────────────────────
+        current_batch = batch
+        current_fallback_mask = fallback_mask_base.clone()
+        current_input_ids = input_ids
+        current_attention_mask = attention_mask
+        current_fused_mask = fused_action_mask
+
+        filter_diag = {
+            "invalid_span_count": 0,
+            "skipped_due_to_nan_reward": 0,
+            "skipped_due_to_non_finite_advantage": 0,
+        }
+
+        invalid_span_mask = fused_action_mask.sum(dim=-1) <= 0
+        if valid_action is not None:
+            invalid_span_mask = invalid_span_mask | (~valid_action)
+        invalid_span_count = int(invalid_span_mask.sum().item())
+        filter_diag["invalid_span_count"] = invalid_span_count
+
+        if invalid_span_count > 0:
+            keep_idx = torch.nonzero(~invalid_span_mask, as_tuple=False).squeeze(-1)
+            if keep_idx.numel() == 0:
+                logger.warning("grpo_skip | reason=no_valid_action_spans_after_tokenization")
+                return
+            current_batch = select_rollout_batch(current_batch, keep_idx)
+            current_input_ids = current_input_ids[keep_idx]
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = current_fused_mask[keep_idx]
+            current_fallback_mask = current_fallback_mask[keep_idx]
+
+        finite_reward_mask = torch.isfinite(current_batch.rewards)
+        dropped_nan = int((~finite_reward_mask).sum().item())
+        filter_diag["skipped_due_to_nan_reward"] = dropped_nan
+        if dropped_nan > 0:
+            keep_idx = torch.nonzero(finite_reward_mask, as_tuple=False).squeeze(-1)
+            if keep_idx.numel() == 0:
+                logger.warning("grpo_skip | reason=all_rewards_non_finite")
+                return
+            current_batch = select_rollout_batch(current_batch, keep_idx)
+            current_input_ids = current_input_ids[keep_idx]
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = current_fused_mask[keep_idx]
+            current_fallback_mask = current_fallback_mask[keep_idx]
+
+        finite_adv_mask = torch.isfinite(current_batch.advantages)
+        dropped_adv = int((~finite_adv_mask).sum().item())
+        filter_diag["skipped_due_to_non_finite_advantage"] = dropped_adv
+        if dropped_adv > 0:
+            keep_idx = torch.nonzero(finite_adv_mask, as_tuple=False).squeeze(-1)
+            if keep_idx.numel() == 0:
+                logger.warning("grpo_skip | reason=all_advantages_non_finite")
+                return
+            current_batch = select_rollout_batch(current_batch, keep_idx)
+            current_input_ids = current_input_ids[keep_idx]
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = current_fused_mask[keep_idx]
+            current_fallback_mask = current_fallback_mask[keep_idx]
+
+        n = len(current_batch.rewritten_prompts)
+        if n == 0:
+            return
+
+        if n < min_effective_batch_size:
+            expand_idx = build_repeated_index(
+                size=n,
+                target_size=min_effective_batch_size,
+                device=current_input_ids.device,
+            )
+            current_batch = select_rollout_batch(current_batch, expand_idx)
+            current_input_ids = current_input_ids[expand_idx]
+            current_attention_mask = _select_optional_tensor(current_attention_mask, expand_idx)
+            current_fused_mask = current_fused_mask[expand_idx]
+            current_fallback_mask = current_fallback_mask[expand_idx]
+            n = len(current_batch.rewritten_prompts)
+
+        # ── Hoist: compute reference log-probs once ─────────────────────────
+        ref_chunks_cpu = []
+        with torch.no_grad():
+            for start in range(0, n, settings.batch_size):
+                end = min(start + settings.batch_size, n)
+                mb_ids = current_input_ids[start:end]
+                mb_mask = current_attention_mask[start:end] if current_attention_mask is not None else None
+                mb_fused = current_fused_mask[start:end]
+                ref_lp = self.reference_model.get_sequence_log_prob(
+                    mb_ids, mb_mask, mb_fused,
+                )
+                ref_chunks_cpu.append(ref_lp.detach().cpu())
+        ref_log_probs = torch.cat(ref_chunks_cpu, dim=0).to(self.policy_model.device)
+
+        # ── LR scheduler for this training cycle ────────────────────────────
+        total_steps = settings.ppo_epochs * max(
+            1,
+            math.ceil(n / settings.batch_size) // settings.gradient_accumulation_steps,
+        )
+        warmup_steps = max(1, int(total_steps * settings.lr_warmup_ratio))
+        if self.scheduler is None and total_steps > 1:
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=self._build_warmup_cosine_lambda(warmup_steps, total_steps),
+            )
+
+        # ── Epoch loop (only gradient updates, everything else precomputed) ─
+        for epoch in range(settings.ppo_epochs):
+            grad_norm: float = 0.0
+            epoch_diag = {
+                "batch_size_loaded": loaded_batch_size,
+                "batch_size_after_filtering": n,
+                "invalid_span_count": filter_diag["invalid_span_count"],
+                "skipped_due_to_nan_reward": filter_diag["skipped_due_to_nan_reward"],
+                "skipped_due_to_non_finite_advantage": filter_diag["skipped_due_to_non_finite_advantage"],
+                "fallback_samples": int(current_fallback_mask.sum().item()),
+                "optimizer_steps": 0,
+            }
+
+            self.optimizer.zero_grad()
+            accum_counter = 0
+
+            for start in range(0, n, settings.batch_size):
+                end = min(start + settings.batch_size, n)
+                mb_ids = current_input_ids[start:end]
+                mb_mask = current_attention_mask[start:end] if current_attention_mask is not None else None
+                mb_fused = current_fused_mask[start:end]
+
+                token_log_probs_new, hidden_states, logits = self.policy_model(mb_ids, mb_mask)
+                seq_log_prob_new = (token_log_probs_new * mb_fused).sum(dim=-1)
+
+                # Entropy regularization from the logits distribution
+                token_probs = F.softmax(logits, dim=-1)
+                token_entropy = -(token_probs * torch.log(token_probs + 1e-10)).sum(dim=-1)
+                seq_entropy = (token_entropy * mb_fused).sum(dim=-1)
+                mb_entropy = seq_entropy.mean()
+
+                # Value head loss
+                value_loss = torch.tensor(0.0, device=seq_log_prob_new.device)
+                if self.value_head is not None and has_value_estimates:
+                    values_new = self.value_head(hidden_states)
+                    values_old = current_batch.values[start:end].to(values_new.device)
+                    returns_mb = current_batch.returns[start:end].to(values_new.device)
+                    value_pred_clipped = values_old + (values_new - values_old).clamp(
+                        -settings.value_clip, settings.value_clip,
+                    )
+                    vl_unclipped = (values_new - returns_mb).pow(2)
+                    vl_clipped = (value_pred_clipped - returns_mb).pow(2)
+                    value_loss = 0.5 * torch.max(vl_unclipped, vl_clipped).mean()
+
+                old_log_prob_mb = current_batch.log_probs_old[start:end]
+                if not torch.isfinite(seq_log_prob_new).all() or not torch.isfinite(old_log_prob_mb).all():
+                    logger.warning(
+                        "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_log_prob",
+                        epoch + 1, start, end,
+                    )
+                    continue
+
+                ratio = torch.exp(seq_log_prob_new - old_log_prob_mb)
+                ratio = torch.clamp(ratio, 0.0, settings.ratio_clip_max)
+
+                ref_mb = ref_log_probs[start:end].to(seq_log_prob_new.device)
+                kl_penalty = self.kl_controller.compute_kl(seq_log_prob_new, ref_mb)
+
+                adv_mb = current_batch.advantages[start:end]
+                fallback_mb = current_fallback_mask[start:end]
+                sample_weights = torch.clamp(
+                    current_batch.sample_weights[start:end].to(seq_log_prob_new.device),
+                    min=0.0,
+                )
+                normalizer = torch.clamp(sample_weights.sum(), min=1e-8)
+
+                grpo_loss_per_sample = -(adv_mb * seq_log_prob_new)
+                ppo_surr1 = ratio * adv_mb
+                ppo_surr2 = torch.clamp(ratio, 1.0 - settings.epsilon, 1.0 + settings.epsilon) * adv_mb
+                ppo_loss_per_sample = -torch.min(ppo_surr1, ppo_surr2)
+
+                policy_loss_per_sample = torch.where(
+                    fallback_mb, ppo_loss_per_sample, grpo_loss_per_sample,
+                )
+                policy_loss = (policy_loss_per_sample * sample_weights).sum() / normalizer
+                kl_loss = (kl_penalty * sample_weights).sum() / normalizer
+                total_loss = (
+                    policy_loss
+                    + settings.beta * kl_loss
+                    + settings.value_coef * value_loss
+                    - settings.entropy_coef * mb_entropy
+                )
+
+                if not torch.isfinite(total_loss):
+                    logger.warning(
+                        "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_total_loss",
+                        epoch + 1, start, end,
+                    )
+                    self.optimizer.zero_grad()
+                    continue
+
+                (total_loss / settings.gradient_accumulation_steps).backward()
+                accum_counter += 1
+
+                if accum_counter % settings.gradient_accumulation_steps == 0 or end == n:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        list(self.policy_model.parameters()), max_norm=1.0,
+                    )
+                    self.optimizer.step()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    epoch_diag["optimizer_steps"] += 1
+                    self.training_step += 1
+
+                self.last_loss = float(total_loss.detach().item())
+                logger.info(
+                    "grpo_loss_diag | epoch=%d | start=%d | end=%d | policy=%.6f | kl=%.6f | value=%.6f | entropy=%.6f | total=%.6f | grad_norm=%.4f | ratio_max=%.4f | fallback=%d/%d",
+                    epoch + 1, start, end,
+                    float(policy_loss.detach().item()),
+                    float(kl_loss.detach().item()),
+                    float(value_loss.detach().item()),
+                    float(mb_entropy.detach().item()),
+                    self.last_loss,
+                    float(grad_norm) if torch.isfinite(torch.tensor(grad_norm)) else -1.0,
+                    float(ratio.max().detach().item()),
+                    int(fallback_mb.sum().item()),
+                    int(fallback_mb.numel()),
+                )
+
+            logger.info(
+                "GRPO Epoch %d/%d | step=%d | loss=%.4f | KL=%.4f | group_reward_std=%.4f | advantage_mean=%.4f | advantage_std=%.4f | batch=%d | filtered=%d | fallback=%d | opt_steps=%d",
+                epoch + 1,
+                settings.ppo_epochs,
+                self.training_step,
+                self.last_loss,
+                self.kl_controller.last_kl,
+                group_reward_std,
+                float(current_batch.advantages.mean().item()) if len(current_batch.advantages) else 0.0,
+                float(current_batch.advantages.std(unbiased=False).item()) if len(current_batch.advantages) > 1 else 0.0,
+                loaded_batch_size,
+                n,
+                epoch_diag["fallback_samples"],
+                epoch_diag["optimizer_steps"],
+            )
+
+            # KL early stopping
+            if self.kl_controller.last_kl > settings.max_abs_kl_for_update:
+                logger.warning(
+                    "grpo_kl_early_stop | epoch=%d | kl=%.6f | threshold=%.6f",
+                    epoch + 1,
+                    self.kl_controller.last_kl,
+                    settings.max_abs_kl_for_update,
+                )
+                break
+
+    @staticmethod
+    def _build_warmup_cosine_lambda(warmup_steps: int, total_steps: int):
+        min_lr_ratio = settings.lr_min_ratio
+
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return max(float(current_step) / float(max(warmup_steps, 1)), min_lr_ratio)
+            progress = float(current_step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_lr_ratio, cosine_decay)
+
+        return lr_lambda
+
+    # ── Checkpoint ──────────────────────────────────────────────────────────
+
+    def _save_checkpoint(self) -> None:
+        if self.policy_model is None or self.value_head is None or self.optimizer is None:
+            raise RuntimeError("Cannot save local checkpoint without initialized model state")
+
+        self.checkpoint_manager.save(
+            policy_model=self.policy_model,
+            value_head_state_dict=self.value_head.state_dict(),
+            optimizer_state_dict=self.optimizer.state_dict(),
+            training_step=self.training_step,
+            extra_meta={
+                "last_loss": self.last_loss,
+                "kl_divergence": self.kl_controller.last_kl,
+                "rollouts_loaded": self.rollouts_loaded,
+            },
+        )
+
+    def _notify_rewriter_reload(self) -> None:
+        rewriter_service_url = os.environ.get("REWRITER_SERVICE_URL", "http://localhost:8000")
+        endpoint = f"{rewriter_service_url}/reload_checkpoint"
+        try:
+            requests.post(endpoint, timeout=30)
+        except requests.RequestException as exc:
+            logger.warning("Failed to notify rewriter checkpoint reload: %s", exc)
+
+    # ── Distributed training ────────────────────────────────────────────────
+
     def _run_distributed_ppo(self, entries: List[RolloutEntry]) -> dict:
         self._ensure_distributed_memory_headroom()
 
@@ -244,7 +605,8 @@ class TrainingLoop:
                 "3",
                 "--tee",
                 "3",
-                str(script_path),
+                "--module",
+                "rl_loop_svc.scripts.distributed_train_once",
                 "--entries-file",
                 str(entries_path),
                 "--result-file",
@@ -462,366 +824,3 @@ class TrainingLoop:
             return kib / (1024 ** 2)
 
         return 0.0
-
-    def _fill_buffer(self, entries: List[RolloutEntry]) -> None:
-        self.buffer.clear()
-        for entry in entries:
-            concept_reward = float(entry.concept_reward) if entry.concept_reward is not None else float(entry.reward)
-            group_id = _resolve_group_id(entry)
-            sample_weight = _resolve_sample_weight(entry)
-            self.buffer.store(
-                reward=entry.reward,
-                log_prob_old=entry.log_prob_old,
-                value_estimate=0.0,
-                original_prompt=entry.original_prompt,
-                rewritten_prompt=entry.rewritten_prompt,
-                concept_reward=concept_reward,
-                group_id=group_id,
-                sample_weight=sample_weight,
-            )
-
-    @staticmethod
-    def _select_optional_tensor(
-        tensor: Optional[torch.Tensor],
-        keep_idx: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if tensor is None:
-            return None
-        return tensor[keep_idx]
-
-    @staticmethod
-    def _select_rollout_batch(batch: RolloutBatch, keep_idx: torch.Tensor) -> RolloutBatch:
-        idx_list = [int(v) for v in keep_idx.detach().cpu().tolist()]
-        return RolloutBatch(
-            rewards=batch.rewards[keep_idx],
-            log_probs_old=batch.log_probs_old[keep_idx],
-            values=batch.values[keep_idx],
-            advantages=batch.advantages[keep_idx],
-            returns=batch.returns[keep_idx],
-            sample_weights=batch.sample_weights[keep_idx],
-            original_prompts=[batch.original_prompts[i] for i in idx_list],
-            rewritten_prompts=[batch.rewritten_prompts[i] for i in idx_list],
-            concept_rewards=batch.concept_rewards[keep_idx],
-            group_ids=[batch.group_ids[i] for i in idx_list],
-        )
-
-    @staticmethod
-    def _build_repeated_index(size: int, target_size: int, device: torch.device) -> torch.Tensor:
-        if size <= 0:
-            return torch.zeros((0,), dtype=torch.long, device=device)
-        if size >= target_size:
-            return torch.arange(size, dtype=torch.long, device=device)
-
-        repeats = int(math.ceil(target_size / float(size)))
-        base = torch.arange(size, dtype=torch.long, device=device)
-        return base.repeat(repeats)[:target_size]
-
-    def _run_ppo_epochs(self) -> None:
-        if self.policy_model is None or self.reference_model is None:
-            raise RuntimeError("Local GRPO run requested without initialized model components")
-        if self.optimizer is None:
-            raise RuntimeError("Local GRPO run requested without optimizer")
-
-        final_rewards = torch.tensor(self.buffer._rewards, dtype=torch.float32)
-        concept_rewards = torch.tensor(self.buffer._concept_rewards, dtype=torch.float32)
-        rewards = (
-            settings.final_reward_beta * final_rewards
-            + settings.concept_reward_alpha * concept_rewards
-        )
-        if settings.normalize_rewards and rewards.numel() > 1:
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-
-        effective_group_ids = _resolve_grpo_group_ids(
-            self.buffer._group_ids,
-            settings.grpo_min_group_size,
-            settings.grpo_group_size,
-        )
-        if effective_group_ids != self.buffer._group_ids:
-            logger.info(
-                "grpo_group_fallback_applied | source_groups=%d | fallback_group_size=%d",
-                len(set(self.buffer._group_ids)),
-                settings.grpo_group_size,
-            )
-
-        fallback_advantages = rewards.clone()
-        if fallback_advantages.numel() > 1:
-            fallback_advantages = (
-                fallback_advantages - fallback_advantages.mean()
-            ) / (fallback_advantages.std(unbiased=False) + 1e-6)
-
-        grpo_advantages = _compute_grpo_relative_rewards(
-            rewards,
-            effective_group_ids,
-            settings.grpo_min_group_size,
-        )
-        fallback_mask_base = _build_grpo_fallback_mask(
-            effective_group_ids,
-            settings.grpo_min_group_size,
-            device=grpo_advantages.device,
-        )
-        advantages = torch.where(fallback_mask_base, fallback_advantages, grpo_advantages)
-
-        group_reward_std = _group_reward_std_mean(
-            rewards,
-            effective_group_ids,
-            settings.grpo_min_group_size,
-        )
-        logger.info(
-            "grpo_advantage_diag | rewards_mean=%.6f | group_reward_std=%.6f | advantage_mean=%.6f | advantage_std=%.6f | fallback_samples=%d",
-            float(rewards.mean().item()) if rewards.numel() else 0.0,
-            group_reward_std,
-            float(advantages.mean().item()) if advantages.numel() else 0.0,
-            float(advantages.std(unbiased=False).item()) if advantages.numel() > 1 else 0.0,
-            int(fallback_mask_base.sum().item()),
-        )
-
-        batch = self.buffer.build(advantages)
-        loaded_batch_size = len(batch.rewritten_prompts)
-        if loaded_batch_size == 0:
-            return
-
-        min_effective_batch_size = max(int(settings.ppo_min_effective_batch_size), 1)
-
-        for epoch in range(settings.ppo_epochs):
-            epoch_diag = {
-                "batch_size_loaded": loaded_batch_size,
-                "batch_size_after_filtering": loaded_batch_size,
-                "batch_size_after_stability_pad": loaded_batch_size,
-                "invalid_span_count": 0,
-                "skipped_due_to_mask_count": 0,
-                "skipped_due_to_nan_reward": 0,
-                "skipped_due_to_advantage_zero": 0,
-                "fallback_samples": int(fallback_mask_base.sum().item()),
-                "optimizer_steps": 0,
-            }
-
-            current_batch = batch
-            fallback_mask = fallback_mask_base.clone()
-
-            tokenized = self.policy_model.tokenize_with_action_mask(
-                batch.original_prompts,
-                batch.rewritten_prompts,
-            )
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized.get("attention_mask")
-            action_mask = tokenized["action_mask"]
-            valid_action = tokenized.get("valid_action")
-
-            invalid_span_mask = action_mask.sum(dim=-1) <= 0
-            if valid_action is not None:
-                invalid_span_mask = invalid_span_mask | (~valid_action)
-
-            invalid_span_count = int(invalid_span_mask.sum().item())
-            epoch_diag["invalid_span_count"] = invalid_span_count
-            if invalid_span_count > 0:
-                epoch_diag["skipped_due_to_mask_count"] = invalid_span_count
-                keep_idx = torch.nonzero(~invalid_span_mask, as_tuple=False).squeeze(-1)
-                if keep_idx.numel() == 0:
-                    logger.warning(
-                        "grpo_epoch_skip | epoch=%d | reason=no_valid_action_spans",
-                        epoch + 1,
-                    )
-                    continue
-                current_batch = self._select_rollout_batch(current_batch, keep_idx)
-                input_ids = input_ids[keep_idx]
-                attention_mask = self._select_optional_tensor(attention_mask, keep_idx)
-                action_mask = action_mask[keep_idx]
-                fallback_mask = fallback_mask[keep_idx]
-
-            finite_reward_mask = torch.isfinite(current_batch.rewards)
-            dropped_nan_reward = int((~finite_reward_mask).sum().item())
-            if dropped_nan_reward > 0:
-                epoch_diag["skipped_due_to_nan_reward"] += dropped_nan_reward
-                keep_idx = torch.nonzero(finite_reward_mask, as_tuple=False).squeeze(-1)
-                if keep_idx.numel() == 0:
-                    logger.warning(
-                        "grpo_epoch_skip | epoch=%d | reason=all_rewards_non_finite",
-                        epoch + 1,
-                    )
-                    continue
-                current_batch = self._select_rollout_batch(current_batch, keep_idx)
-                input_ids = input_ids[keep_idx]
-                attention_mask = self._select_optional_tensor(attention_mask, keep_idx)
-                action_mask = action_mask[keep_idx]
-                fallback_mask = fallback_mask[keep_idx]
-
-            advantage_keep_mask = torch.isfinite(current_batch.advantages)
-            dropped_non_finite_adv = int((~advantage_keep_mask).sum().item())
-            if dropped_non_finite_adv > 0:
-                epoch_diag["skipped_due_to_advantage_zero"] += dropped_non_finite_adv
-                keep_idx = torch.nonzero(advantage_keep_mask, as_tuple=False).squeeze(-1)
-                if keep_idx.numel() == 0:
-                    logger.warning(
-                        "grpo_epoch_skip | epoch=%d | reason=all_advantages_non_finite",
-                        epoch + 1,
-                    )
-                    continue
-                current_batch = self._select_rollout_batch(current_batch, keep_idx)
-                input_ids = input_ids[keep_idx]
-                attention_mask = self._select_optional_tensor(attention_mask, keep_idx)
-                action_mask = action_mask[keep_idx]
-                fallback_mask = fallback_mask[keep_idx]
-
-            n = len(current_batch.rewritten_prompts)
-            epoch_diag["batch_size_after_filtering"] = n
-            if n == 0:
-                continue
-
-            if n < min_effective_batch_size:
-                expand_idx = self._build_repeated_index(
-                    size=n,
-                    target_size=min_effective_batch_size,
-                    device=input_ids.device,
-                )
-                current_batch = self._select_rollout_batch(current_batch, expand_idx)
-                input_ids = input_ids[expand_idx]
-                attention_mask = self._select_optional_tensor(attention_mask, expand_idx)
-                action_mask = action_mask[expand_idx]
-                fallback_mask = fallback_mask[expand_idx]
-                n = len(current_batch.rewritten_prompts)
-
-            epoch_diag["batch_size_after_stability_pad"] = n
-            epoch_diag["fallback_samples"] = int(fallback_mask.sum().item())
-
-            ref_chunks_cpu = []
-            with torch.no_grad():
-                for start in range(0, n, settings.batch_size):
-                    end = min(start + settings.batch_size, n)
-                    mb_ids = input_ids[start:end]
-                    mb_mask = attention_mask[start:end] if attention_mask is not None else None
-                    mb_action_mask = action_mask[start:end]
-                    ref_lp = self.reference_model.get_sequence_log_prob(
-                        mb_ids,
-                        mb_mask,
-                        mb_action_mask,
-                    )
-                    ref_chunks_cpu.append(ref_lp.detach().cpu())
-
-            ref_log_probs = torch.cat(ref_chunks_cpu, dim=0).to(self.policy_model.device)
-
-            self.optimizer.zero_grad()
-            accum_counter = 0
-
-            for start in range(0, n, settings.batch_size):
-                end = min(start + settings.batch_size, n)
-                mb_ids = input_ids[start:end]
-                mb_mask = attention_mask[start:end] if attention_mask is not None else None
-                mb_action_mask = action_mask[start:end]
-
-                token_log_probs_new, _ = self.policy_model(mb_ids, mb_mask)
-                if mb_mask is not None:
-                    mb_action_mask = mb_action_mask * mb_mask[:, 1:].to(dtype=mb_action_mask.dtype)
-                seq_log_prob_new = (token_log_probs_new * mb_action_mask).sum(dim=-1)
-
-                old_log_prob_mb = current_batch.log_probs_old[start:end]
-                if not torch.isfinite(seq_log_prob_new).all() or not torch.isfinite(old_log_prob_mb).all():
-                    logger.warning(
-                        "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_log_prob",
-                        epoch + 1,
-                        start,
-                        end,
-                    )
-                    continue
-
-                ratio = torch.exp(seq_log_prob_new - old_log_prob_mb)
-                ref_mb = ref_log_probs[start:end].to(seq_log_prob_new.device)
-                kl_penalty = self.kl_controller.compute_kl(seq_log_prob_new, ref_mb)
-
-                adv_mb = current_batch.advantages[start:end]
-                fallback_mb = fallback_mask[start:end]
-                sample_weights = torch.clamp(
-                    current_batch.sample_weights[start:end].to(seq_log_prob_new.device),
-                    min=0.0,
-                )
-                normalizer = torch.clamp(sample_weights.sum(), min=1e-8)
-
-                grpo_loss_per_sample = -(adv_mb * seq_log_prob_new)
-                ppo_surr1 = ratio * adv_mb
-                ppo_surr2 = torch.clamp(ratio, 1.0 - settings.epsilon, 1.0 + settings.epsilon) * adv_mb
-                ppo_loss_per_sample = -torch.min(ppo_surr1, ppo_surr2)
-
-                policy_loss_per_sample = torch.where(
-                    fallback_mb,
-                    ppo_loss_per_sample,
-                    grpo_loss_per_sample,
-                )
-                policy_loss = (policy_loss_per_sample * sample_weights).sum() / normalizer
-                kl_loss = (torch.clamp(kl_penalty, min=0.0) * sample_weights).sum() / normalizer
-                total_loss = policy_loss + (settings.beta * kl_loss)
-
-                if not torch.isfinite(total_loss):
-                    logger.warning(
-                        "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_total_loss",
-                        epoch + 1,
-                        start,
-                        end,
-                    )
-                    self.optimizer.zero_grad()
-                    continue
-
-                (total_loss / settings.gradient_accumulation_steps).backward()
-                accum_counter += 1
-
-                if accum_counter % settings.gradient_accumulation_steps == 0 or end == n:
-                    torch.nn.utils.clip_grad_norm_(list(self.policy_model.parameters()), max_norm=1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    epoch_diag["optimizer_steps"] += 1
-                    self.training_step += 1
-
-                self.last_loss = float(total_loss.detach().item())
-                logger.info(
-                    "grpo_loss_diag | epoch=%d | start=%d | end=%d | policy_loss=%.6f | kl=%.6f | total_loss=%.6f | fallback=%d/%d",
-                    epoch + 1,
-                    start,
-                    end,
-                    float(policy_loss.detach().item()),
-                    float(kl_loss.detach().item()),
-                    self.last_loss,
-                    int(fallback_mb.sum().item()),
-                    int(fallback_mb.numel()),
-                )
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            logger.info(
-                "GRPO Epoch %d/%d | step=%d | loss=%.4f | KL=%.4f | group_reward_std=%.4f | advantage_mean=%.4f | advantage_std=%.4f | batch_size_loaded=%d | batch_size_after_filtering=%d | batch_size_after_stability_pad=%d | fallback_samples=%d | optimizer_steps=%d",
-                epoch + 1,
-                settings.ppo_epochs,
-                self.training_step,
-                self.last_loss,
-                self.kl_controller.last_kl,
-                group_reward_std,
-                float(current_batch.advantages.mean().item()) if len(current_batch.advantages) else 0.0,
-                float(current_batch.advantages.std(unbiased=False).item()) if len(current_batch.advantages) > 1 else 0.0,
-                epoch_diag["batch_size_loaded"],
-                epoch_diag["batch_size_after_filtering"],
-                epoch_diag["batch_size_after_stability_pad"],
-                epoch_diag["fallback_samples"],
-                epoch_diag["optimizer_steps"],
-            )
-
-    def _save_checkpoint(self) -> None:
-        if self.policy_model is None or self.value_head is None or self.optimizer is None:
-            raise RuntimeError("Cannot save local checkpoint without initialized model state")
-
-        self.checkpoint_manager.save(
-            policy_model=self.policy_model,
-            value_head_state_dict=self.value_head.state_dict(),
-            optimizer_state_dict=self.optimizer.state_dict(),
-            training_step=self.training_step,
-            extra_meta={
-                "last_loss": self.last_loss,
-                "kl_divergence": self.kl_controller.last_kl,
-                "rollouts_loaded": self.rollouts_loaded,
-            },
-        )
-
-    def _notify_rewriter_reload(self) -> None:
-        rewriter_service_url = os.environ.get("REWRITER_SERVICE_URL", "http://localhost:8000")
-        endpoint = f"{rewriter_service_url}/reload_checkpoint"
-        try:
-            requests.post(endpoint, timeout=30)
-        except requests.RequestException as exc:
-            logger.warning("Failed to notify rewriter checkpoint reload: %s", exc)

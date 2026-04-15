@@ -12,9 +12,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "app", "static")
 
 from flask import Flask, jsonify, request, send_from_directory
-from app.validator import validate_request
-from app.storage import store_instruction, get_all_instructions
-from app.forwarder import forward_to_prompt_rewriter
+from .app.validator import validate_request
+from .app.storage import store_instruction, get_all_instructions
+from .app.forwarder import forward_to_prompt_rewriter
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(

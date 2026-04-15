@@ -4,9 +4,10 @@ KL divergence controller.
 Computes the per-sample KL divergence between the current policy and the
 frozen reference model, and adjusts the reward accordingly.
 
-reward_adjusted = reward - beta * KL
+Uses the Schulman (2020) approximation:
+    KL ~= 0.5 * (log_prob_policy - log_prob_reference)^2
 
-where KL = log_prob_policy - log_prob_reference
+This is symmetric and unbiased, unlike the one-sided clamp it replaces.
 """
 
 import logging
@@ -34,18 +35,17 @@ class KLController:
         lp_ref: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Element-wise KL divergence estimate.
+        Element-wise KL divergence estimate (Schulman approximation).
 
         Args:
-            log_prob_policy:    Shape (B,) — log-probs under current policy.
-            log_prob_reference: Shape (B,) — log-probs under frozen reference.
+            lp_policy:  Shape (B,) -- log-probs under current policy.
+            lp_ref:     Shape (B,) -- log-probs under frozen reference.
 
         Returns:
-            kl: Shape (B,) — KL divergence per sample.
+            kl: Shape (B,) -- KL divergence per sample (always >= 0).
         """
-        # KL divergence is always >= 0
-        # Clamp to non-negative to prevent negative KL from corrupting loss
-        kl = (lp_policy - lp_ref).clamp(min=0.0)
+        log_ratio = lp_policy - lp_ref
+        kl = 0.5 * log_ratio.pow(2)
         self._last_kl = kl.mean().item()
         return kl
 

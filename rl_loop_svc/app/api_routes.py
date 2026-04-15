@@ -10,7 +10,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
-from rl.lifecycle_manager import TrainerState
+from ..rl.lifecycle_manager import TrainerState
 
 logger = logging.getLogger(__name__)
 
@@ -233,3 +233,32 @@ def submit_rollout(submission: RolloutSubmission) -> RolloutAck:
 @router.post("/rollout_batch", response_model=RolloutAck)
 def submit_rollout_batch(submission: RolloutBatchSubmission) -> RolloutAck:
     return _persist_rollout_batch(submission.rollouts, submission.run_id)
+
+
+class RewardServiceRollout(BaseModel):
+    """Schema matching reward_metrics_svc rollout payload (spec S16)."""
+    note_id: str
+    state: str
+    action: str
+    reward: float
+    log_prob_old: float
+    value_estimate: float = 0.0
+
+
+@router.post("/ingest_rollout", response_model=RolloutAck)
+def ingest_rollout(payload: RewardServiceRollout) -> RolloutAck:
+    """Accept rollout from reward_metrics_svc and map to internal schema.
+
+    Rollouts with empty state or action (e.g. from val/test evaluation calls)
+    are discarded to prevent training data pollution.
+    """
+    if not payload.state.strip() or not payload.action.strip():
+        return RolloutAck(accepted=False, file_path="", accepted_count=0, duplicate_count=0)
+    mapped = RolloutSubmission(
+        original_prompt=payload.state,
+        rewritten_prompt=payload.action,
+        reward=max(-1.0, min(1.0, payload.reward)),
+        log_prob_old=payload.log_prob_old,
+        value_estimate=payload.value_estimate,
+    )
+    return _persist_rollout_batch([mapped], None)

@@ -17,13 +17,13 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from rewriter_inference_svc.config import (
+from .config import (
     MODEL_NAME,
     RL_CHECKPOINT_PATH,
     REWRITER_LOAD_LOCAL_CHECKPOINTS,
     VALUE_HEAD_HIDDEN_SIZE,
 )
-from rewriter_inference_svc.logger import get_logger
+from .logger import get_logger
 
 log = get_logger(__name__)
 

@@ -18,9 +18,9 @@ import math
 import logging
 from typing import Dict, List, Optional, Tuple
 
-import tree as _tree
-from config import W_TREE, W_EXACT, W_STRUCTURE
-from metrics import distance_with_components
+from .config import W_TREE, W_EXACT, W_STRUCTURE
+from .metrics import distance_with_components
+from .similarity import sim
 
 logger = logging.getLogger("reward_metrics_svc.reward")
 
@@ -163,8 +163,6 @@ def _worst_gt_coverage(gt: List[str], pred: List[str]) -> str:
     """GT code with the lowest coverage score (spec §14.3)."""
     if not gt or not pred:
         return gt[0] if gt else ""
-    from similarity import sim
-
     pairs = [(g, max(sim(g, p) for p in pred)) for g in gt]
     return min(pairs, key=lambda x: x[1])[0]
 
@@ -173,7 +171,5 @@ def _worst_pred_match(pred: List[str], gt: List[str]) -> str:
     """Predicted code with the lowest match score to any GT (spec §14.3)."""
     if not pred or not gt:
         return pred[0] if pred else ""
-    from similarity import sim
-
     pairs = [(p, max(sim(p, g) for g in gt)) for p in pred]
     return min(pairs, key=lambda x: x[1])[0]

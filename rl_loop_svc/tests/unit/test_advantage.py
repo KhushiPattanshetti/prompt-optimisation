@@ -5,7 +5,7 @@ Unit tests: GAE advantage computation
 import pytest
 import torch
 
-from rl.advantage import compute_gae
+from ...rl.advantage import compute_gae
 
 
 class TestComputeGAE:

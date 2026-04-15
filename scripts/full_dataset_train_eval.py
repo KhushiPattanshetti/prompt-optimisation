@@ -351,24 +351,10 @@ def flush_and_wait_reward_queue(
     reward_url: str,
     timeout_sec: int = 120,
 ) -> Dict:
-    t0 = time.time()
-    last_status: Dict = {}
-
-    while True:
-        fr = session.post(f"{reward_url}/queue/flush", timeout=30)
-        fr.raise_for_status()
-
-        sr = session.get(f"{reward_url}/queue/status", timeout=30)
-        sr.raise_for_status()
-        last_status = sr.json()
-
-        if int(last_status.get("pending_count", 0)) == 0:
-            return last_status
-
-        if time.time() - t0 > timeout_sec:
-            raise RuntimeError(f"reward queue drain timeout: status={last_status}")
-
-        time.sleep(1)
+    """No-op: reward_metrics_svc delivers rollouts synchronously via POST,
+    so there is no queue to flush.  Returns a stub status dict so call-site
+    logging (e.g. ``qst.get('pending_count')``) keeps working."""
+    return {"pending_count": 0}
 
 
 def median_or_zero(xs: List[float]) -> float:
@@ -546,6 +532,7 @@ def main() -> int:
                         "generation_source": rwj.get("generation_source"),
                         "log_prob_old": rwj.get("log_prob_old"),
                         "value_estimate": rwj.get("value_estimate"),
+                        "skip_reward_forward": split != "train",
                     },
                     timeout=args.request_timeout,
                 )
@@ -571,11 +558,13 @@ def main() -> int:
                 else:
                     t2 = now()
                     rr = session.post(
-                        f"{args.reward_url}/reward",
+                        f"{args.reward_url}/compute_reward",
                         json={
+                            "note_id": note_id,
                             "gt_codes": gt_codes,
                             "enh_codes": icj.get("enh_codes", []),
                             "org_codes": icj.get("org_codes", []),
+                            "parsing_success": icj.get("parsing_success", True),
                         },
                         timeout=60,
                     )

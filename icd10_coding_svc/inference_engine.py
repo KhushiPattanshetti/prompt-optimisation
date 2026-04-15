@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import torch
 
-from icd10_coding_svc import code_parser, gt_fetcher, model_loader
-from icd10_coding_svc.config import (
+from . import code_parser, gt_fetcher, model_loader
+from .config import (
     DO_SAMPLE,
     ICD_INPUT_MAX_LENGTH,
     ICD_PARSE_RECOVERY_ENABLED,
@@ -24,7 +24,7 @@ from icd10_coding_svc.config import (
     SYSTEM_INSTRUCTION,
     TEMPERATURE,
 )
-from icd10_coding_svc.logger import get_logger
+from .logger import get_logger
 
 log = get_logger("inference_engine")
 
@@ -213,7 +213,7 @@ def _run_single_pass(prompt: str, model, tokenizer) -> str:
 
 
 def _forward_to_reward_service(payload: Dict[str, Any]) -> None:
-    url = f"{REWARD_SERVICE_URL}/reward"
+    url = f"{REWARD_SERVICE_URL}/compute_reward"
     for attempt in range(2):
         try:
             response = requests.post(url, json=payload, timeout=10)
@@ -254,6 +254,7 @@ def run_inference(
     run_id: Optional[str] = None,
     group_id: Optional[str] = None,
     generation_source: Optional[str] = None,
+    skip_reward_forward: bool = False,
 ) -> Dict[str, Any]:
     gt_codes: List[str] = gt_fetcher.get_gt_codes(note_id)
     model, tokenizer = model_loader.load_model()
@@ -324,24 +325,21 @@ def run_inference(
 
     _save_output(output_payload)
 
-    _forward_to_reward_service(
-        {
-            "note_id": note_id,
-            "run_id": run_id,
-            "group_id": group_id,
-            "gt_codes": gt_codes,
-            "enh_codes": enh_codes,
-            "org_codes": org_codes,
-            "enh_parse_ok": enh_parse_ok,
-            "org_parse_ok": org_parse_ok,
-            "both_parse_success": both_parse_success,
-            "original_prompt": original_prompt,
-            "rewritten_prompt": rewritten_prompt,
-            "generation_source": generation_source,
-            "log_prob_old": log_prob_old,
-            "value_estimate": value_estimate,
-        }
-    )
+    if not skip_reward_forward:
+        _forward_to_reward_service(
+            {
+                "note_id": note_id,
+                "gt_codes": gt_codes,
+                "enh_codes": enh_codes,
+                "org_codes": org_codes,
+                "parsing_success": parsing_success,
+                "enh_raw_output": enh_raw,
+                "state": original_prompt,
+                "action": rewritten_prompt,
+                "log_prob_old": float(log_prob_old or 0.0),
+                "value_estimate": float(value_estimate or 0.0),
+            }
+        )
 
     return {
         "note_id": note_id,

@@ -6,8 +6,8 @@ parent_map, depth_map, and that the BFS produces accurate depths.
 """
 
 import pytest
-import tree as _tree
-from config import VIRTUAL_ROOT
+from reward_metrics_svc import tree as _tree
+from reward_metrics_svc.config import VIRTUAL_ROOT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
