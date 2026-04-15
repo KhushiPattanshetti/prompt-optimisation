@@ -4,6 +4,9 @@ Endpoint:
     POST /rewrite_prompt
 """
 
+import os
+import sys
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -17,11 +20,22 @@ from .schemas import RewriteRequest, RewriteResponse
 
 log = get_logger(__name__)
 
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from pipeline_logger import ServiceIOLogger
+    from pipeline_logger.hash_utils import prompt_hash
+
+    _io = ServiceIOLogger("rewriter_svc")
+    _PRETTY_LOG = True
+except Exception:
+    _PRETTY_LOG = False
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     load_model()
     yield
+
 
 app = FastAPI(
     title="Rewriter Inference Service",
@@ -42,11 +56,29 @@ def rewrite_prompt(request: RewriteRequest) -> RewriteResponse:
     """
     log.info("request_received | note_length=%d", len(request.clinical_note))
 
+    if _PRETTY_LOG:
+        _io.log_input(
+            note_id=request.note_id or "—",
+            prompt_hash=prompt_hash(request.clinical_note),
+            note_length=len(request.clinical_note),
+        )
+
+    t0 = time.perf_counter()
     try:
         result = run_inference(request.clinical_note, note_id=request.note_id)
     except Exception as exc:
         log.exception("inference_failed | error=%s", exc)
         raise HTTPException(status_code=500, detail="Inference failed.") from exc
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    if _PRETTY_LOG:
+        _io.log_output(
+            note_id=request.note_id or "—",
+            rewritten_hash=prompt_hash(result["rewritten_prompt"]),
+            generation_source=result["generation_source"],
+            elapsed_ms=elapsed_ms,
+        )
 
     return RewriteResponse(
         rewritten_prompt=result["rewritten_prompt"],

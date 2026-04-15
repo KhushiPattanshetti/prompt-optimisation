@@ -1,3 +1,6 @@
+import os
+import sys
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,6 +11,16 @@ from .logger import get_logger
 from .schemas import CodeRequest, CodeResponse
 
 log = get_logger("app")
+
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from pipeline_logger import ServiceIOLogger
+    from pipeline_logger.hash_utils import prompt_hash
+
+    _io = ServiceIOLogger("icd10_svc")
+    _PRETTY_LOG = True
+except Exception:
+    _PRETTY_LOG = False
 
 
 @asynccontextmanager
@@ -21,6 +34,14 @@ app = FastAPI(title="icd10_coding_svc", lifespan=lifespan)
 
 @app.post("/generate_codes", response_model=CodeResponse)
 def generate_codes(request: CodeRequest):
+    if _PRETTY_LOG:
+        _io.log_input(
+            note_id=request.note_id,
+            rewritten_hash=prompt_hash(request.rewritten_prompt),
+            original_hash=prompt_hash(request.original_prompt),
+        )
+
+    t0 = time.perf_counter()
     result = inference_engine.run_inference(
         note_id=request.note_id,
         run_id=request.run_id,
@@ -32,6 +53,17 @@ def generate_codes(request: CodeRequest):
         value_estimate=request.value_estimate,
         skip_reward_forward=request.skip_reward_forward,
     )
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    if _PRETTY_LOG:
+        _io.log_output(
+            note_id=request.note_id,
+            enh_codes=", ".join(result.get("enh_codes", [])) or "—",
+            og_codes=", ".join(result.get("org_codes", [])) or "—",
+            gt_codes=", ".join(result.get("gt_codes", [])) or "—",
+            elapsed_ms=elapsed_ms,
+        )
+
     return CodeResponse(**result)
 
 

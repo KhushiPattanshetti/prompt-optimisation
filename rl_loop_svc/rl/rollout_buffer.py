@@ -24,6 +24,10 @@ class RolloutBatch:
     original_prompts: List[str] = field(default_factory=list)
     rewritten_prompts: List[str] = field(default_factory=list)
     group_ids: List[str] = field(default_factory=list)
+    rollout_ids: List[str] = field(default_factory=list)
+    og_codes: List[List[str]] = field(default_factory=list)
+    enh_codes: List[List[str]] = field(default_factory=list)
+    gt_codes: List[List[str]] = field(default_factory=list)
 
     def __len__(self) -> int:
         return self.rewards.shape[0]
@@ -48,6 +52,10 @@ class RolloutBuffer:
         self._group_ids: List[str] = []
         self._original_prompts: List[str] = []
         self._rewritten_prompts: List[str] = []
+        self._rollout_ids: List[str] = []
+        self._og_codes: List[List[str]] = []
+        self._enh_codes: List[List[str]] = []
+        self._gt_codes: List[List[str]] = []
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -61,6 +69,10 @@ class RolloutBuffer:
         original_prompt: str,
         rewritten_prompt: str,
         sample_weight: float = 1.0,
+        rollout_id: str = "",
+        og_codes: List[str] | None = None,
+        enh_codes: List[str] | None = None,
+        gt_codes: List[str] | None = None,
     ) -> None:
         """Append a single trajectory step to the buffer."""
         self._rewards.append(reward)
@@ -71,6 +83,10 @@ class RolloutBuffer:
         self._group_ids.append(group_id)
         self._original_prompts.append(original_prompt)
         self._rewritten_prompts.append(rewritten_prompt)
+        self._rollout_ids.append(rollout_id)
+        self._og_codes.append(og_codes or [])
+        self._enh_codes.append(enh_codes or [])
+        self._gt_codes.append(gt_codes or [])
 
     def build(self, advantages: torch.Tensor) -> RolloutBatch:
         """
@@ -83,8 +99,12 @@ class RolloutBuffer:
             RolloutBatch ready for PPO updates.
         """
         rewards = torch.tensor(self._rewards, dtype=torch.float32, device=self.device)
-        concept_rewards = torch.tensor(self._concept_rewards, dtype=torch.float32, device=self.device)
-        sample_weights = torch.tensor(self._sample_weights, dtype=torch.float32, device=self.device)
+        concept_rewards = torch.tensor(
+            self._concept_rewards, dtype=torch.float32, device=self.device
+        )
+        sample_weights = torch.tensor(
+            self._sample_weights, dtype=torch.float32, device=self.device
+        )
         log_probs_old = torch.tensor(
             self._log_probs_old, dtype=torch.float32, device=self.device
         )
@@ -103,6 +123,10 @@ class RolloutBuffer:
             original_prompts=list(self._original_prompts),
             rewritten_prompts=list(self._rewritten_prompts),
             group_ids=list(self._group_ids),
+            rollout_ids=list(self._rollout_ids),
+            og_codes=list(self._og_codes),
+            enh_codes=list(self._enh_codes),
+            gt_codes=list(self._gt_codes),
         )
 
     def clear(self) -> None:
@@ -115,6 +139,10 @@ class RolloutBuffer:
         self._group_ids.clear()
         self._original_prompts.clear()
         self._rewritten_prompts.clear()
+        self._rollout_ids.clear()
+        self._og_codes.clear()
+        self._enh_codes.clear()
+        self._gt_codes.clear()
 
     def __len__(self) -> int:
         return len(self._rewards)

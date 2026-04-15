@@ -8,7 +8,7 @@ validation, and documentation stay in one place.
 from __future__ import annotations
 
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,6 +24,11 @@ class Rollout(BaseModel):
     # Optional metadata added during preprocessing
     group_id: Optional[str] = None
     sample_weight: float = 1.0
+
+    # ICD-10 code lists — set by reward_metrics_svc caller, forwarded to rl_loop_svc
+    og_codes: List[str] = Field(default_factory=list)
+    enh_codes: List[str] = Field(default_factory=list)
+    gt_codes: List[str] = Field(default_factory=list)
 
     @field_validator("rollout_id")
     @classmethod

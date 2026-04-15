@@ -54,6 +54,20 @@ class RolloutEntry(BaseModel):
         description="Optional value estimate V(s) at collection time",
     )
 
+    # ICD-10 code lists forwarded from reward_metrics_svc for pretty logging
+    og_codes: List[str] = Field(
+        default_factory=list,
+        description="ICD-10 codes extracted from the original prompt",
+    )
+    enh_codes: List[str] = Field(
+        default_factory=list,
+        description="ICD-10 codes extracted from the rewritten (enhanced) prompt",
+    )
+    gt_codes: List[str] = Field(
+        default_factory=list,
+        description="Ground-truth ICD-10 codes for this clinical note",
+    )
+
 
 class RolloutFile(BaseModel):
     """Top-level wrapper matching the JSON files written to rollouts/."""

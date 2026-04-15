@@ -33,6 +33,9 @@ inference_outputs/
 reward_queue/
 reward_metrics_svc/icd10_tree.json
 
+# Pretty pipeline logs (runtime artefacts, never commit)
+pipeline_logs/
+
 # Runtime rollouts and local state
 rl_loop_svc/rollouts/*.jsonl
 rl_loop_svc/rollouts/.seen_files

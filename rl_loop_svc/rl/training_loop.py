@@ -35,6 +35,21 @@ from ..schemas.rollout_schema import RolloutEntry
 from ..storage.checkpoint_manager import CheckpointManager
 from ..storage.rollout_loader import RolloutLoader
 
+try:
+    _pkg_root = str(Path(__file__).resolve().parents[3])
+    if _pkg_root not in sys.path:
+        sys.path.insert(0, _pkg_root)
+    from pipeline_logger.system_logger import write_csv_rows, write_batch_summary
+    from pipeline_logger.hash_utils import prompt_hash
+    from pipeline_logger.mode_resolver import resolve_mode1, resolve_mode2
+    from pipeline_logger.run_context import get_run_context
+    from pipeline_logger import ServiceIOLogger
+
+    _rl_io = ServiceIOLogger("rl_loop_svc")
+    _PRETTY_LOG = True
+except Exception:
+    _PRETTY_LOG = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +115,7 @@ class TrainingLoop:
         self.training_step = 0
         self.last_loss = 0.0
         self.rollouts_loaded = 0
+        self.batch_counter = 0
         self.last_train_success: Optional[bool] = None
         self.last_train_error: Optional[str] = None
         self.last_train_started_at: Optional[str] = None
@@ -114,6 +130,14 @@ class TrainingLoop:
             return False
 
         self.rollouts_loaded += len(entries)
+        self.batch_counter += 1
+
+        if _PRETTY_LOG:
+            _rl_io.log_input(
+                batch_num=self.batch_counter,
+                n_entries=len(entries),
+                mode2=resolve_mode2(settings.ppo_epochs),
+            )
 
         if self._distributed_mode:
             self.lifecycle.transition(TrainerState.TRAIN)
@@ -176,6 +200,10 @@ class TrainingLoop:
                 concept_reward=concept_reward,
                 group_id=group_id,
                 sample_weight=sample_weight,
+                rollout_id=entry.rollout_id or "",
+                og_codes=list(entry.og_codes),
+                enh_codes=list(entry.enh_codes),
+                gt_codes=list(entry.gt_codes),
             )
 
     def _compute_value_estimates(self, prompts: List[str]) -> List[float]:
@@ -427,6 +455,76 @@ class TrainingLoop:
         # ── Epoch loop (only gradient updates, everything else precomputed) ─
         for epoch in range(settings.ppo_epochs):
             grad_norm: float = 0.0
+
+            # ── Pretty system log (CSV + ASCII table) ───────────────────────
+            if _PRETTY_LOG:
+                _mode1 = resolve_mode1(settings.grpo_enabled, has_value_estimates)
+                _mode2 = resolve_mode2(settings.ppo_epochs)
+                _, _run_id = get_run_context()
+                _run_id = _run_id or "unknown"
+                _ts = datetime.now(timezone.utc).isoformat()
+                _log_entries = [
+                    {
+                        "ts": _ts,
+                        "run_id": _run_id,
+                        "mode1": _mode1,
+                        "mode2": _mode2,
+                        "batch_num": self.batch_counter,
+                        "iter_num": epoch + 1,
+                        "batch_size": loaded_batch_size,
+                        "max_iters": settings.ppo_epochs,
+                        "rollout_id": (
+                            current_batch.rollout_ids[i]
+                            if i < len(current_batch.rollout_ids)
+                            else ""
+                        ),
+                        "prompt_hash": prompt_hash(current_batch.original_prompts[i]),
+                        "rewritten_hash": prompt_hash(
+                            current_batch.rewritten_prompts[i]
+                        ),
+                        "og_codes": (
+                            current_batch.og_codes[i]
+                            if i < len(current_batch.og_codes)
+                            else []
+                        ),
+                        "enh_codes": (
+                            current_batch.enh_codes[i]
+                            if i < len(current_batch.enh_codes)
+                            else []
+                        ),
+                        "gt_codes": (
+                            current_batch.gt_codes[i]
+                            if i < len(current_batch.gt_codes)
+                            else []
+                        ),
+                        "reward": float(current_batch.rewards[i].item()),
+                    }
+                    for i in range(len(current_batch.original_prompts))
+                ]
+                write_csv_rows(_log_entries)
+                write_batch_summary(
+                    run_id=_run_id,
+                    mode1=_mode1,
+                    mode2=_mode2,
+                    batch_num=self.batch_counter,
+                    iter_num=epoch + 1,
+                    max_iters=settings.ppo_epochs,
+                    batch_size=loaded_batch_size,
+                    entries=_log_entries,
+                )
+                _rl_io.log_output(
+                    batch_num=self.batch_counter,
+                    iter_num=epoch + 1,
+                    mode1=_mode1,
+                    mode2=_mode2,
+                    n_prompts=len(_log_entries),
+                    mean_reward=(
+                        f"{sum(e['reward'] for e in _log_entries)/len(_log_entries):.4f}"
+                        if _log_entries
+                        else "n/a"
+                    ),
+                )
+
             epoch_diag = {
                 "batch_size_loaded": loaded_batch_size,
                 "batch_size_after_filtering": n,

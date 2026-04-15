@@ -9,6 +9,8 @@ POST /health           spec §14.2
 """
 
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -30,6 +32,15 @@ from .schemas import (
 )
 
 logger = logging.getLogger("reward_metrics_svc.app")
+
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from pipeline_logger import ServiceIOLogger
+
+    _io = ServiceIOLogger("reward_svc")
+    _PRETTY_LOG = True
+except Exception:
+    _PRETTY_LOG = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,11 +152,30 @@ def compute_reward_endpoint(req: RewardRequest) -> RewardResponse:
         value_estimate=req.value_estimate,
     )
 
-    # ── 9. Build response ─────────────────────────────────────────────────────
+    # ── 9. Pretty I/O log ────────────────────────────────────────────────────
+    if _PRETTY_LOG:
+        _io.log_input(
+            note_id=req.note_id,
+            og_codes=", ".join(org) or "—",
+            enh_codes=", ".join(enh) or "—",
+            gt_codes=", ".join(gt) or "—",
+        )
+        _io.log_output(
+            note_id=req.note_id,
+            reward=f"{reward:+.4f}",
+            R_tree=f"{rc['R_tree']:.4f}",
+            R_exact=f"{rc['R_exact']:.4f}",
+            R_structure=f"{rc['R_structure']:.4f}",
+        )
+
+    # ── 10. Build response ───────────────────────────────────────────────────
     diag = metrics["diagnostics"]
     return RewardResponse(
         note_id=req.note_id,
         reward=reward,
+        og_codes=org,
+        enh_codes=enh,
+        gt_codes=gt,
         metrics=RewardMetrics(
             D_enh=metrics["D_enh"],
             D_org=metrics["D_org"],

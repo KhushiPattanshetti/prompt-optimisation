@@ -77,6 +77,10 @@ class RewardResponse(BaseModel):
     note_id: str
     reward: float
     metrics: RewardMetrics
+    # Code lists echoed back so callers can build the pretty-log payload
+    og_codes: List[str] = []
+    enh_codes: List[str] = []
+    gt_codes: List[str] = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

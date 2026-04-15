@@ -6,8 +6,10 @@ services:
     ports: ["8003:8003"]
     volumes:
       - ./data:/app/data
+      - pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
       interval: 10s
@@ -27,6 +29,7 @@ services:
       - ./sft_checkpoints:/app/sft_checkpoints
       - ./inference_outputs:/app/inference_outputs
       - ./best_prompts_cache:/app/best_prompts_cache
+      - pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=${REWRITER_CHECKPOINT_DIR:-/app/rl_checkpoints}
@@ -39,6 +42,7 @@ services:
       - REWRITER_GUARD_MIN_KEYWORD_HITS=${REWRITER_GUARD_MIN_KEYWORD_HITS:-2}
       - NVIDIA_VISIBLE_DEVICES=0
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
     depends_on:
       dataset_svc:
         condition: service_healthy
@@ -66,6 +70,7 @@ services:
       - ./hf_cache:/app/hf_cache
       - ./inference_outputs:/app/inference_outputs
       - ./gt_codes:/app/gt_codes
+      - pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - DATASET_SVC_URL=http://dataset_svc:8003
@@ -73,6 +78,7 @@ services:
       - HF_HOME=/app/hf_cache
       - NVIDIA_VISIBLE_DEVICES=1
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
     depends_on:
       dataset_svc:
         condition: service_healthy
@@ -99,12 +105,14 @@ services:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
       - ./reward_queue:/app/reward_queue
+      - pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_BLOCK_ENDPOINT=http://rl_loop_svc:8004/rollout
       - RL_SERVICE_URL=http://rl_loop_svc:8004/ingest_rollout
       - ROLLOUT_QUEUE_DIR=/app/reward_queue
       - ROLLOUT_REQUIRE_PARSE_COMPARABILITY=${ROLLOUT_REQUIRE_PARSE_COMPARABILITY:-true}
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 10s
@@ -122,6 +130,7 @@ services:
       - ./hf_cache:/app/hf_cache
       - ./rl_checkpoints:/app/rl_checkpoints
       - ./rl_loop_svc/rollouts:/app/rl_loop_svc/rollouts
+      - pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=/app/rl_checkpoints
@@ -147,6 +156,7 @@ services:
       - RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION=${RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION:-false}
       - RL_PPO_DEBUG_CLAMP_ADVANTAGES=${RL_PPO_DEBUG_CLAMP_ADVANTAGES:-false}
       - RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS=${RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS:-false}
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
     depends_on:
       dataset_svc:
         condition: service_healthy
@@ -168,3 +178,5 @@ services:
       retries: 10
       start_period: 300s
 
+volumes:
+  pipeline_logs:

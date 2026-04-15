@@ -13,6 +13,17 @@ from .config import settings
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+try:
+    _pkg_root = str(Path(__file__).resolve().parents[3])
+    if _pkg_root not in sys.path:
+        sys.path.insert(0, _pkg_root)
+    from pipeline_logger.run_context import init_run
+    from pipeline_logger.mode_resolver import resolve_mode1, resolve_mode2
+
+    _PRETTY_LOG = True
+except Exception:
+    _PRETTY_LOG = False
+
 
 def _use_distributed_training() -> bool:
     return settings.distributed_enabled and settings.distributed_world_size > 1
@@ -90,6 +101,21 @@ async def lifespan(_: FastAPI):
             settings.rollouts_dir,
             settings.checkpoints_dir,
         )
+
+        if _PRETTY_LOG:
+            # Resolve modes at startup — mode1 defaults to GRPO/Hybrid/PPO based on
+            # settings; has_value_estimates is assumed True in non-distributed mode.
+            _mode1 = resolve_mode1(
+                grpo_enabled=settings.grpo_enabled,
+                has_value_estimates=not _use_distributed_training(),
+            )
+            _mode2 = resolve_mode2(settings.ppo_epochs)
+            _base, _run_id = init_run(_mode1, _mode2)
+            logger.info(
+                "pipeline_logger_init | run_id=%s | logs_dir=%s",
+                _run_id,
+                _base / _run_id,
+            )
 
         if settings.startup_log_gpu_inventory:
             _log_gpu_inventory()
