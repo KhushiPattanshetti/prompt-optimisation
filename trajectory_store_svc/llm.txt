@@ -1,0 +1,350 @@
+SYSTEM ROLE:
+You are building a complete microservice named trajectory_store_svc.
+The service must be fully functional, testable, and runnable standalone.
+
+The goal is to:
+- generate rollouts
+- store them
+- prepare training batches (advantages computed)
+- expose batch outputs via filesystem
+
+Do NOT implement any training logic.
+Do NOT implement reward computation logic.
+
+
+--------------------------------------------------
+1. SERVICE REQUIREMENTS
+--------------------------------------------------
+
+Implement a Python microservice using:
+
+- FastAPI (for health/debug endpoints only)
+- Pure Python modules for core logic
+- File-based storage (JSONL + batch JSON files)
+
+Project structure must be:
+
+trajectory_store_svc/
+│
+├── main.py
+├── config.py
+├── api/
+│   └── routes.py
+├── schemas/
+│   └── rollout_schema.py
+├── storage/
+│   └── rollout_loader.py
+├── buffer/
+│   └── rollout_buffer.py
+├── processing/
+│   ├── preprocessing.py
+│   ├── reward_processing.py
+│   └── advantage.py
+├── serving/
+│   └── batch_writer.py
+├── simulation/
+│   └── simulator.py
+├── tests/
+│   ├── test_unit.py
+│   ├── test_integration.py
+│   └── test_simulation.py
+└── utils/
+    └── logging.py
+
+
+--------------------------------------------------
+2. CORE PIPELINE
+--------------------------------------------------
+
+Pipeline must be implemented exactly as:
+
+generate rollout
+→ fetch reward (external call stub)
+→ store rollout (JSONL)
+→ load rollouts via RolloutLoader
+→ fill RolloutBuffer
+→ compute advantages
+→ build batch
+→ write batch file
+
+
+--------------------------------------------------
+3. ROLLOUT GENERATION
+--------------------------------------------------
+
+Implement a rollout generator module:
+
+Each rollout must contain:
+- rollout_id (uuid)
+- prompt (string)
+- rewritten_prompt (string)
+- log_prob_old (float)
+- value_estimate (float)
+- reward (float)
+
+Reward must be fetched via a stub function:
+
+get_reward(prompt, rewritten_prompt) → float
+
+IMPORTANT:
+- Do NOT compute reward locally
+- Assume reward is already normalized
+
+
+--------------------------------------------------
+4. STORAGE LAYER
+--------------------------------------------------
+
+Implement JSONL-based storage:
+
+- Append rollouts to:
+  rollouts_dir/rollouts_<timestamp>.jsonl
+
+- Maintain:
+  - seen_files.json
+  - segment_offsets.json
+
+RolloutLoader must:
+- read files incrementally
+- track offsets
+- avoid duplicate reads
+- support restart recovery
+
+
+--------------------------------------------------
+5. PREPROCESSING
+--------------------------------------------------
+
+Implement:
+
+_resolve_group_id(entry)
+_resolve_sample_weight(entry)
+
+Group ID:
+- hash of prompt or rollout_id (deterministic)
+
+Sample weight:
+- default = 1.0
+
+
+--------------------------------------------------
+6. BUFFER LAYER
+--------------------------------------------------
+
+Implement:
+
+- RolloutBuffer class
+- RolloutBatch class
+- _fill_buffer()
+
+Behavior:
+- accumulate rollouts until batch_size
+- convert into tensors / lists required for training
+
+
+--------------------------------------------------
+7. REWARD HANDLING
+--------------------------------------------------
+
+- Use reward directly from rollout
+
+Normalization rule:
+- If reward is already normalized → DO NOT normalize again
+- If config.normalize_rewards = True AND reward is raw → normalize
+
+Do NOT recompute or decompose reward
+
+
+--------------------------------------------------
+8. ADVANTAGE COMPUTATION
+--------------------------------------------------
+
+Implement:
+
+_compute_grpo_relative_rewards
+_resolve_grpo_group_ids
+_build_grpo_fallback_mask
+
+Outputs:
+- advantages
+- returns
+
+Support modes:
+- standard
+- grpo
+- hybrid
+
+Config-driven behavior
+
+
+--------------------------------------------------
+9. BATCH SERVING
+--------------------------------------------------
+
+Write batch files:
+
+prepared_batches/prepared_batch_<batch_id>.json
+
+Each file must contain:
+- batch_id
+- rollout_ids
+- rewards
+- advantages
+- returns
+- group_ids
+- sample_weights
+
+No API-based serving required
+
+
+--------------------------------------------------
+10. BATCH MODES
+--------------------------------------------------
+
+Implement two modes:
+
+Mode: repeat
+- reuse same batch for max_batch_reuse_count
+
+Mode: single_pass
+- consume each batch once
+
+Maintain state:
+- current_batch_id
+- reuse_count
+- batch_index
+
+
+--------------------------------------------------
+11. CONFIGURATION
+--------------------------------------------------
+
+config.py must include:
+
+- rollouts_dir
+- prepared_batches_dir
+- batch_size
+- normalize_rewards
+
+- grpo_enabled
+- grpo_group_size
+- grpo_min_group_size
+- hybrid_advantage_lambda
+
+- batch_reuse_mode
+- max_batch_reuse_count
+
+
+--------------------------------------------------
+12. API ENDPOINTS (MINIMAL)
+--------------------------------------------------
+
+Expose via FastAPI:
+
+GET /status
+- returns:
+  - total_rollouts
+  - total_batches
+  - current_mode
+
+
+--------------------------------------------------
+13. TESTING REQUIREMENTS
+--------------------------------------------------
+
+13.1 Unit Tests
+
+Test:
+- rollout creation
+- JSONL read/write
+- offset tracking
+- preprocessing correctness
+- buffer filling
+- advantage computation
+- normalization guard
+
+
+13.2 Integration Tests
+
+Test full pipeline:
+
+- rollout → storage → batch → file output
+
+Test modes:
+
+Repeat:
+- batch reused correctly
+
+Single-pass:
+- batches consumed sequentially
+
+Ensure:
+- no duplicate rollouts
+- correct batch sizes
+
+
+13.3 Failure Tests
+
+- corrupted JSONL handling
+- partial writes
+- empty buffer
+- insufficient rollouts
+
+
+--------------------------------------------------
+14. SIMULATION MODE
+--------------------------------------------------
+
+Implement simulation/simulator.py
+
+Capabilities:
+
+- generate synthetic rollouts
+- bypass external reward service
+- configurable:
+  - num_rollouts
+  - reward distribution
+  - batch_size
+
+Run full pipeline end-to-end
+
+
+--------------------------------------------------
+15. LOGGING
+--------------------------------------------------
+
+Log at each stage:
+
+- rollout creation (id, reward)
+- file writes
+- batch creation (size, reward mean/std)
+- advantage stats
+- batch reuse behavior
+
+Errors:
+- corrupted entries
+- skipped rollouts
+
+
+--------------------------------------------------
+16. NON-RESPONSIBILITIES
+--------------------------------------------------
+
+Do NOT implement:
+- PPO loss
+- model training
+- checkpointing
+- reward computation logic
+
+
+--------------------------------------------------
+17. SUCCESS CRITERIA
+--------------------------------------------------
+
+The service is complete if:
+
+- running simulator produces batch files
+- batches contain valid advantages
+- tests pass
+- restart does not duplicate rollouts
+- batch reuse modes behave correctly
