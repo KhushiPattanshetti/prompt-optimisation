@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .config import MODEL_NAME
-from .inference_engine import run_inference, update_best_prompt_cache
+from .inference_engine import run_inference, run_inference_batch, update_best_prompt_cache
 from .logger import get_logger
 from .model_loader import get_cached_model, load_model, reload_from_latest_checkpoint
 from .schemas import RewriteRequest, RewriteResponse
@@ -65,7 +65,12 @@ def rewrite_prompt(request: RewriteRequest) -> RewriteResponse:
 
     t0 = time.perf_counter()
     try:
-        result = run_inference(request.clinical_note, note_id=request.note_id)
+        result = run_inference(
+            request.clinical_note,
+            note_id=request.note_id,
+            sampling_nonce=request.sampling_nonce,
+            disable_best_prompt_cache=request.disable_best_prompt_cache,
+        )
     except Exception as exc:
         log.exception("inference_failed | error=%s", exc)
         raise HTTPException(status_code=500, detail="Inference failed.") from exc
@@ -77,6 +82,7 @@ def rewrite_prompt(request: RewriteRequest) -> RewriteResponse:
             note_id=request.note_id or "—",
             rewritten_hash=prompt_hash(result["rewritten_prompt"]),
             generation_source=result["generation_source"],
+            rejection_reason=result.get("rejection_reason"),
             elapsed_ms=elapsed_ms,
         )
 
@@ -85,7 +91,43 @@ def rewrite_prompt(request: RewriteRequest) -> RewriteResponse:
         log_prob_old=result["log_prob_old"],
         value_estimate=result["value_estimate"],
         generation_source=result["generation_source"],
+        rejection_reason=result.get("rejection_reason"),
+        rejection_reason_counts=dict(result.get("rejection_reason_counts", {})),
     )
+
+
+@app.post("/rewrite_prompt_batch", response_model=list[RewriteResponse])
+def rewrite_prompt_batch(requests: list[RewriteRequest]) -> list[RewriteResponse]:
+    for request in requests:
+        log.info("batch_request_received | note_length=%d", len(request.clinical_note))
+
+    payload = [
+        {
+            "note_id": request.note_id,
+            "clinical_note": request.clinical_note,
+            "sampling_nonce": request.sampling_nonce,
+            "disable_best_prompt_cache": request.disable_best_prompt_cache,
+        }
+        for request in requests
+    ]
+
+    try:
+        batch_results = run_inference_batch(payload)
+    except Exception as exc:
+        log.exception("batch_inference_failed | error=%s", exc)
+        raise HTTPException(status_code=500, detail="Batch inference failed.") from exc
+
+    return [
+        RewriteResponse(
+            rewritten_prompt=result["rewritten_prompt"],
+            log_prob_old=result["log_prob_old"],
+            value_estimate=result["value_estimate"],
+            generation_source=result["generation_source"],
+            rejection_reason=result.get("rejection_reason"),
+            rejection_reason_counts=dict(result.get("rejection_reason_counts", {})),
+        )
+        for result in batch_results
+    ]
 
 
 @app.post("/reload_checkpoint")

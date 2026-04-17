@@ -135,7 +135,9 @@ docker compose exec dataset_svc python scripts/full_dataset_train_eval.py \
   --rl-url http://rl_loop_svc:8004 \
   --max-notes 20 \
   --batch-size 4 \
-  --train-every 4
+  --train-every 4 \
+  --service-ready-attempts 600 \
+  --service-ready-sleep-sec 2
 ```
 
 ### Full run over complete dataset
@@ -200,6 +202,7 @@ docker compose down -v
 
 - Service does not become healthy:
   - Run `docker compose logs -f <service_name>` and check model/data path errors.
+  - For first-time ICD startup, model initialization can take several minutes; use `--service-ready-attempts` to avoid early orchestrator timeout.
 - Data file missing errors:
   - Ensure [data/notes.csv](data/notes.csv), [data/diagnoses.csv](data/diagnoses.csv), and [data/section111_valid_icd10_october2025.xlsx](data/section111_valid_icd10_october2025.xlsx) exist, or run `python data/download_data.py`.
 - Missing ICD tree JSON:

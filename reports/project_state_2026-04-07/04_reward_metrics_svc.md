@@ -166,7 +166,7 @@ Inputs:
 Outputs:
 - exact_reward
 - semantic_reward and semantic_score
-- concept_reward, precision, recall, f1
+- precision, recall, f1
 - structure_reward
 - delta_reward
 - bonuses/penalty
@@ -201,10 +201,9 @@ If degraded and fail-fast is enabled, endpoint can reject training acknowledgeme
 ## 5.5 Description and embedding helpers
 
 Modules:
-- icd_descriptions.py: loads/normalizes ICD description map
 - embedding_model.py: embedding generation and similarity helpers
 
-These modules support semantic and concept reward branches.
+These modules support semantic reward branches.
 
 ## 6. How this service connects upstream/downstream
 
@@ -218,13 +217,12 @@ Downstream dependencies:
 
 ## 7. Current limitations
 
-- Concept branch quality still depends on descriptor extraction quality upstream.
 - Reward variance can be low in small run windows.
 - Embedding computation adds latency and dependency complexity.
 
 ## 8. Future improvements
 
 1. Dynamic component weighting by confidence and training phase.
-2. Stronger descriptor-to-ontology alignment for concept reward quality.
+2. Stronger descriptor-to-ontology alignment for semantic reward quality.
 3. Better run-profile presets for faster calibration and diagnostics.
 4. Automatic alerting on prolonged transport degradation.

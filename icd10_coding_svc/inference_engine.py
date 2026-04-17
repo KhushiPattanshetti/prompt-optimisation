@@ -150,6 +150,22 @@ def _extract_clinical_note(prompt: str) -> str:
     return text.strip()
 
 
+def _compose_enhanced_prompt(rewritten_prompt: str, original_prompt: str) -> str:
+    instruction = str(rewritten_prompt or "").strip()
+    note_text = _extract_clinical_note(original_prompt)
+    if not note_text:
+        return instruction
+
+    if "clinical note:" in instruction.lower() and note_text[:120] in instruction:
+        return instruction
+
+    return (
+        f"{instruction}\n\n"
+        "Clinical note:\n"
+        f"{note_text}"
+    )
+
+
 def _build_recovery_prompt(prompt: str) -> str:
     note_text = _extract_clinical_note(prompt)
     clipped_note = _truncate_note_for_recovery(
@@ -198,6 +214,15 @@ def _run_single_pass(prompt: str, model, tokenizer) -> str:
         truncation=True,
         max_length=ICD_INPUT_MAX_LENGTH,
     ).to(model.device)
+
+    token_count = int(encoding["input_ids"].shape[1])
+    if token_count >= int(ICD_INPUT_MAX_LENGTH):
+        log.warning(
+            "input_truncation_near_limit | tokens=%d | token_limit=%d | prompt_chars=%d",
+            token_count,
+            int(ICD_INPUT_MAX_LENGTH),
+            len(formatted),
+        )
 
     input_len = encoding["input_ids"].shape[1]
     output_ids = model.generate(
@@ -258,15 +283,16 @@ def run_inference(
 ) -> Dict[str, Any]:
     gt_codes: List[str] = gt_fetcher.get_gt_codes(note_id)
     model, tokenizer = model_loader.load_model()
+    enhanced_prompt = _compose_enhanced_prompt(rewritten_prompt, original_prompt)
 
     with _inference_lock:
         with torch.no_grad():
-            enh_raw = _run_single_pass(rewritten_prompt, model, tokenizer)
+            enh_raw = _run_single_pass(enhanced_prompt, model, tokenizer)
             org_raw = _run_single_pass(original_prompt, model, tokenizer)
             enh_codes = code_parser.parse_icd10_codes(enh_raw, warn_on_empty=False)
             org_codes = code_parser.parse_icd10_codes(org_raw, warn_on_empty=False)
             enh_raw, enh_codes, enh_recovery_used = _recover_parse_if_needed(
-                prompt=rewritten_prompt,
+                prompt=enhanced_prompt,
                 raw_output=enh_raw,
                 parsed_codes=enh_codes,
                 model=model,
@@ -310,6 +336,7 @@ def run_inference(
         "org_codes": org_codes,
         "original_prompt": original_prompt,
         "rewritten_prompt": rewritten_prompt,
+        "enhanced_input_prompt": enhanced_prompt,
         "generation_source": generation_source,
         "log_prob_old": log_prob_old,
         "value_estimate": value_estimate,

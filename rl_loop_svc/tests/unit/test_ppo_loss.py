@@ -15,7 +15,6 @@ from ...rl.rollout_buffer import RolloutBatch
 
 def _make_batch(size: int = 4) -> RolloutBatch:
     rewards = torch.rand(size)
-    concept_rewards = torch.rand(size)
     sample_weights = torch.ones(size)
     log_probs = torch.full((size,), -5.0)
     values = torch.rand(size)
@@ -27,7 +26,6 @@ def _make_batch(size: int = 4) -> RolloutBatch:
         values=values,
         advantages=advantages,
         returns=returns,
-        concept_rewards=concept_rewards,
         sample_weights=sample_weights,
         original_prompts=[f"p{i}" for i in range(size)],
         rewritten_prompts=[f"r{i}" for i in range(size)],
@@ -132,7 +130,6 @@ class TestPPOLoss:
             "values": torch.tensor([0.0, 0.0]),
             "advantages": torch.tensor([1.0, 1.0]),
             "returns": torch.tensor([0.0, 0.0]),
-            "concept_rewards": torch.tensor([0.0, 0.0]),
             "original_prompts": ["p0", "p1"],
             "rewritten_prompts": ["r0", "r1"],
             "group_ids": ["g0", "g1"],

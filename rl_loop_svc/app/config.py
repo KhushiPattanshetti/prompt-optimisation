@@ -25,8 +25,6 @@ class Settings(BaseSettings):
     max_abs_kl_for_update: float = 100.0
     normalize_rewards: bool = True
 
-    concept_reward_alpha: float = 0.5
-    final_reward_beta: float = 0.5
     hybrid_advantage_lambda: float = 0.6
     grpo_enabled: bool = True
     grpo_min_group_size: int = 3
@@ -37,6 +35,11 @@ class Settings(BaseSettings):
     gradient_accumulation_steps: int = 4
     ppo_min_effective_batch_size: int = 8
     ppo_epochs: int = 3
+    dynamic_iteration_enabled: bool = True
+    dynamic_min_epochs: int = 1
+    dynamic_patience: int = 2
+    dynamic_loss_improvement_threshold: float = 1e-4
+    dynamic_grad_norm_floor: float = 1e-4
     learning_rate: float = 3e-5
     lr_warmup_ratio: float = 0.1
     lr_min_ratio: float = 0.1
@@ -63,15 +66,29 @@ class Settings(BaseSettings):
     ppo_debug_clamp_advantages: bool = False
     ppo_debug_disable_rollout_filters: bool = False
 
+    # Execution modes
+    sbmi_enabled: bool = True
+    sbmi_epochs: int = 4
+    mbmi_enabled: bool = False
+    mbmi_training_batch_size: int = 16
+    mbmi_epochs: int = 2
+
+    # Hybrid enforcement
+    hybrid_mode_enforced: bool = True
+    value_head_enabled: bool = True
+
     poll_interval_seconds: float = 5.0
 
     # trajectory_store_svc integration
     # When set, the RolloutLoader will also poll this directory for rollout JSONL
     # files written by trajectory_store_svc (i.e. its rollouts_store/ output).
     trajectory_store_rollouts_dir: Optional[Path] = None
-    # Base URL of the trajectory_store_svc HTTP service.  Used by the status
+    # Base URL of the trajectory_store_svc HTTP service. Used by the status
     # endpoint to surface trajectory store health alongside training state.
-    trajectory_store_url: str = "http://localhost:8200"
+    # Empty disables health probing to avoid blocking status checks.
+    trajectory_store_url: str = ""
+    trajectory_store_status_timeout_seconds: float = 0.25
+    trajectory_store_healthcheck_ttl_seconds: float = 2.0
 
 
 settings = Settings()

@@ -13,6 +13,7 @@ not in the prepared-batch JSON files served by the trajectory store API.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -30,10 +31,17 @@ class TrajectoryStoreClient:
     """
 
     def __init__(
-        self, base_url: str = "http://localhost:8200", timeout: float = 5.0
+        self,
+        base_url: str = "http://localhost:8200",
+        timeout: float = 0.25,
+        cache_ttl_seconds: float = 2.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._session = requests.Session()
+        self._last_status: Optional[dict] = None
+        self._last_status_ts: float = 0.0
 
     def get_status(self) -> Optional[dict]:
         """
@@ -42,11 +50,23 @@ class TrajectoryStoreClient:
         Returns the parsed JSON dict on success, or ``None`` if the service
         is unreachable or returns a non-2xx response.
         """
+        now = time.monotonic()
+        if (
+            self._last_status_ts > 0
+            and (now - self._last_status_ts) < self.cache_ttl_seconds
+        ):
+            return self._last_status
+
         try:
-            resp = requests.get(f"{self.base_url}/status", timeout=self.timeout)
+            resp = self._session.get(f"{self.base_url}/status", timeout=self.timeout)
             resp.raise_for_status()
-            return resp.json()
+            status = resp.json()
+            self._last_status = status
+            self._last_status_ts = now
+            return status
         except requests.RequestException as exc:
+            self._last_status = None
+            self._last_status_ts = now
             logger.debug("trajectory_store_svc unreachable: %s", exc)
             return None
 

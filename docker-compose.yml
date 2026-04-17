@@ -6,7 +6,8 @@ services:
     ports: ["8003:8003"]
     volumes:
       - ./data:/app/data
-      - pipeline_logs:/app/pipeline_logs
+      - ./run_results:/app/run_results
+      - ./pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - PIPELINE_LOGS_DIR=/app/pipeline_logs
@@ -29,17 +30,22 @@ services:
       - ./sft_checkpoints:/app/sft_checkpoints
       - ./inference_outputs:/app/inference_outputs
       - ./best_prompts_cache:/app/best_prompts_cache
-      - pipeline_logs:/app/pipeline_logs
+      - ./pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=${REWRITER_CHECKPOINT_DIR:-/app/rl_checkpoints}
       - HF_HOME=/app/hf_cache
       - REWRITER_MODEL_NAME=${REWRITER_MODEL_NAME:-ishanmane/phi3-rewriter-sft}
       - REWRITER_LOAD_LOCAL_CHECKPOINTS=${REWRITER_LOAD_LOCAL_CHECKPOINTS:-false}
-      - REWRITER_MODEL_VARIANT=${REWRITER_MODEL_VARIANT:-base}
-      - REWRITER_INPUT_MODE=${REWRITER_INPUT_MODE:-dynamic}
-      - REWRITER_ENABLE_POSTFILTER_GUARD=${REWRITER_ENABLE_POSTFILTER_GUARD:-true}
-      - REWRITER_GUARD_MIN_KEYWORD_HITS=${REWRITER_GUARD_MIN_KEYWORD_HITS:-2}
+      - DO_SAMPLE=${REWRITER_DO_SAMPLE:-false}
+      - TEMPERATURE=${REWRITER_TEMPERATURE:-0.8}
+      - TOP_P=${REWRITER_TOP_P:-0.92}
+      - TOP_K=${REWRITER_TOP_K:-50}
+      - REWRITER_MAX_PROMPT_TOKENS=${REWRITER_MAX_PROMPT_TOKENS:-4096}
+      - REWRITER_HARD_MAX_PROMPT_TOKENS=${REWRITER_HARD_MAX_PROMPT_TOKENS:-4096}
+      - REWRITER_MAX_NEW_TOKENS_HARD_CAP=${REWRITER_MAX_NEW_TOKENS_HARD_CAP:-48}
+      - REWRITER_MAX_BATCH_ITEMS=${REWRITER_MAX_BATCH_ITEMS:-4}
+      - REWRITER_MAX_RAW_NOTE_CHARS=${REWRITER_MAX_RAW_NOTE_CHARS:-6000}
       - NVIDIA_VISIBLE_DEVICES=0
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - PIPELINE_LOGS_DIR=/app/pipeline_logs
@@ -60,6 +66,54 @@ services:
       retries: 10
       start_period: 300s
 
+  rewriter_svc_b:
+    build: .
+    container_name: rewriter_svc_b
+    command: uvicorn rewriter_inference_svc.app:app --host 0.0.0.0 --port 8005
+    ports: ["8005:8005"]
+    volumes:
+      - ./data:/app/data
+      - ./hf_cache:/app/hf_cache
+      - ./rl_checkpoints:/app/rl_checkpoints
+      - ./sft_checkpoints:/app/sft_checkpoints
+      - ./inference_outputs:/app/inference_outputs
+      - ./best_prompts_cache:/app/best_prompts_cache
+      - ./pipeline_logs:/app/pipeline_logs
+    environment:
+      - PYTHONPATH=/app
+      - RL_CHECKPOINT_DIR=${REWRITER_CHECKPOINT_DIR:-/app/rl_checkpoints}
+      - HF_HOME=/app/hf_cache
+      - REWRITER_MODEL_NAME=${REWRITER_MODEL_NAME:-ishanmane/phi3-rewriter-sft}
+      - REWRITER_LOAD_LOCAL_CHECKPOINTS=${REWRITER_LOAD_LOCAL_CHECKPOINTS:-false}
+      - DO_SAMPLE=${REWRITER_DO_SAMPLE:-false}
+      - TEMPERATURE=${REWRITER_TEMPERATURE:-0.8}
+      - TOP_P=${REWRITER_TOP_P:-0.92}
+      - TOP_K=${REWRITER_TOP_K:-50}
+      - REWRITER_MAX_PROMPT_TOKENS=${REWRITER_MAX_PROMPT_TOKENS:-4096}
+      - REWRITER_HARD_MAX_PROMPT_TOKENS=${REWRITER_HARD_MAX_PROMPT_TOKENS:-4096}
+      - REWRITER_MAX_NEW_TOKENS_HARD_CAP=${REWRITER_MAX_NEW_TOKENS_HARD_CAP:-48}
+      - REWRITER_MAX_BATCH_ITEMS=${REWRITER_MAX_BATCH_ITEMS:-4}
+      - REWRITER_MAX_RAW_NOTE_CHARS=${REWRITER_MAX_RAW_NOTE_CHARS:-6000}
+      - NVIDIA_VISIBLE_DEVICES=3
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - PIPELINE_LOGS_DIR=/app/pipeline_logs
+    depends_on:
+      dataset_svc:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
   icd10_svc:
     build: .
     container_name: icd10_svc
@@ -70,11 +124,13 @@ services:
       - ./hf_cache:/app/hf_cache
       - ./inference_outputs:/app/inference_outputs
       - ./gt_codes:/app/gt_codes
-      - pipeline_logs:/app/pipeline_logs
+      - ./pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - DATASET_SVC_URL=http://dataset_svc:8003
       - REWARD_SERVICE_URL=http://reward_svc:8002
+      - ICD_INPUT_MAX_LENGTH=${ICD_INPUT_MAX_LENGTH:-4096}
+      - ICD_PARSE_RECOVERY_MAX_NOTE_CHARS=${ICD_PARSE_RECOVERY_MAX_NOTE_CHARS:-12000}
       - HF_HOME=/app/hf_cache
       - NVIDIA_VISIBLE_DEVICES=1
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -105,7 +161,7 @@ services:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
       - ./reward_queue:/app/reward_queue
-      - pipeline_logs:/app/pipeline_logs
+      - ./pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_BLOCK_ENDPOINT=http://rl_loop_svc:8004/rollout
@@ -130,21 +186,21 @@ services:
       - ./hf_cache:/app/hf_cache
       - ./rl_checkpoints:/app/rl_checkpoints
       - ./rl_loop_svc/rollouts:/app/rl_loop_svc/rollouts
-      - pipeline_logs:/app/pipeline_logs
+      - ./pipeline_logs:/app/pipeline_logs
     environment:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=/app/rl_checkpoints
       - REWRITER_SERVICE_URL=http://rewriter_svc:8000
       - HF_HOME=/app/hf_cache
-      - NVIDIA_VISIBLE_DEVICES=0,1,2,3
+      - NVIDIA_VISIBLE_DEVICES=2
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - RL_MODEL_NAME=${RL_MODEL_NAME:-ishanmane/phi3-rewriter-sft}
       - RL_HIDDEN_SIZE=3072
-      - RL_POLICY_CUDA_DEVICE=2
-      - RL_REFERENCE_CUDA_DEVICE=3
-      - RL_BATCH_SIZE=${RL_BATCH_SIZE:-4}
-      - RL_GRADIENT_ACCUMULATION_STEPS=4
-      - RL_POLICY_MAX_LENGTH=${RL_POLICY_MAX_LENGTH:-1024}
+      - RL_POLICY_CUDA_DEVICE=0
+      - RL_REFERENCE_CUDA_DEVICE=0
+      - RL_BATCH_SIZE=${RL_BATCH_SIZE:-2}
+      - RL_GRADIENT_ACCUMULATION_STEPS=8
+      - RL_POLICY_MAX_LENGTH=${RL_POLICY_MAX_LENGTH:-768}
       - RL_DISTRIBUTED_ENABLED=false
       - RL_DISTRIBUTED_WORLD_SIZE=4
       - RL_DISTRIBUTED_MIN_FREE_RAM_GB=64
@@ -164,12 +220,14 @@ services:
         condition: service_healthy
       rewriter_svc:
         condition: service_healthy
+      rewriter_svc_b:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["0", "1", "2", "3"]
+              device_ids: ["2"]
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8004/status"]

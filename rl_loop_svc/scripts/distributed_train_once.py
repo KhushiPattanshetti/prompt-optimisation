@@ -62,6 +62,18 @@ def _all_reduce_scalar(value: float, device: torch.device, world_size: int) -> f
     return float(tensor.item())
 
 
+def _all_reduce_sum(value: float, device: torch.device) -> float:
+    tensor = torch.tensor(value, dtype=torch.float32, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def _all_reduce_max(value: float, device: torch.device) -> float:
+    tensor = torch.tensor(value, dtype=torch.float32, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
 def _build_rank_slice(
     rank: int,
     world_size: int,
@@ -205,39 +217,17 @@ def main() -> None:
 
         buffer = RolloutBuffer(device=str(device))
         for idx, entry in enumerate(entries):
-            concept_reward = (
-                float(entry.concept_reward)
-                if entry.concept_reward is not None
-                else float(entry.reward)
-            )
-            # group_id and sample_weight are pre-computed by trajectory_store_svc upstream
-            group_id = (
-                entry.group_id or f"g_{abs(hash(entry.original_prompt)) % (2**32):08x}"
-            )
-            sample_weight = (
-                float(entry.sample_weight) if entry.sample_weight is not None else 1.0
-            )
             buffer.store(
                 reward=entry.reward,
                 log_prob_old=entry.log_prob_old,
                 value_estimate=value_estimates[idx],
                 original_prompt=entry.original_prompt,
                 rewritten_prompt=entry.rewritten_prompt,
-                concept_reward=concept_reward,
-                group_id=group_id,
-                sample_weight=sample_weight,
+                group_id=resolve_group_id(entry),
+                sample_weight=resolve_sample_weight(entry),
             )
 
-        final_rewards = torch.tensor(
-            buffer._rewards, dtype=torch.float32, device=device
-        )
-        concept_rewards = torch.tensor(
-            buffer._concept_rewards, dtype=torch.float32, device=device
-        )
-        rewards = (
-            settings.final_reward_beta * final_rewards
-            + settings.concept_reward_alpha * concept_rewards
-        )
+        rewards = torch.tensor(buffer._rewards, dtype=torch.float32, device=device)
 
         effective_group_ids = resolve_grpo_group_ids(
             buffer._group_ids,
@@ -320,9 +310,22 @@ def main() -> None:
 
         global_batch_size = settings.batch_size * world_size
 
-        for epoch in range(settings.ppo_epochs):
+        min_epochs = max(1, int(settings.dynamic_min_epochs))
+        max_epochs = max(min_epochs, int(settings.ppo_epochs))
+        if not settings.dynamic_iteration_enabled:
+            min_epochs = max_epochs
+
+        prev_epoch_avg_loss: float | None = None
+        low_improvement_streak = 0
+        low_grad_streak = 0
+
+        for epoch in range(max_epochs):
             optimizer.zero_grad()
             accum_counter = 0
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
+            epoch_optimizer_steps = 0
+            epoch_max_grad_norm = 0.0
 
             for global_start in range(0, n, global_batch_size):
                 local_start, local_end = _build_rank_slice(
@@ -373,18 +376,24 @@ def main() -> None:
                             )
                             if should_step:
                                 _all_reduce_gradients(trainable_params, world_size)
-                                torch.nn.utils.clip_grad_norm_(
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
                                     trainable_params, max_norm=1.0
                                 )
                                 optimizer.step()
                                 optimizer.zero_grad()
                                 training_step += 1
+                                epoch_optimizer_steps += 1
                                 last_loss = _all_reduce_scalar(
                                     local_total_loss, device, world_size
                                 )
                                 last_kl = _all_reduce_scalar(
                                     local_kl, device, world_size
                                 )
+                                grad_norm_float = float(grad_norm)
+                                if torch.isfinite(torch.tensor(grad_norm_float)):
+                                    epoch_max_grad_norm = max(
+                                        epoch_max_grad_norm, grad_norm_float
+                                    )
                             continue
 
                         idx_list = [int(v) for v in valid_idx.detach().cpu().tolist()]
@@ -447,6 +456,8 @@ def main() -> None:
 
                     local_total_loss = float(total_loss.detach().item())
                     local_kl = float(kl_loss.detach().item())
+                    epoch_loss_sum += local_total_loss
+                    epoch_loss_count += 1
                 else:
                     dummy = torch.zeros((), dtype=torch.float32, device=device)
                     for parameter in trainable_params:
@@ -465,22 +476,42 @@ def main() -> None:
                     continue
 
                 _all_reduce_gradients(trainable_params, world_size)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+                epoch_optimizer_steps += 1
+                grad_norm_float = float(grad_norm)
+                if torch.isfinite(torch.tensor(grad_norm_float)):
+                    epoch_max_grad_norm = max(epoch_max_grad_norm, grad_norm_float)
 
                 training_step += 1
                 last_loss = _all_reduce_scalar(local_total_loss, device, world_size)
                 last_kl = _all_reduce_scalar(local_kl, device, world_size)
 
+            global_loss_sum = _all_reduce_sum(epoch_loss_sum, device)
+            global_loss_count = _all_reduce_sum(float(epoch_loss_count), device)
+            global_optimizer_steps = _all_reduce_sum(float(epoch_optimizer_steps), device)
+            global_max_grad_norm = _all_reduce_max(epoch_max_grad_norm, device)
+
+            epoch_avg_loss: float | None = None
+            if global_loss_count > 0:
+                epoch_avg_loss = float(global_loss_sum / global_loss_count)
+
             if rank == 0:
                 logger.info(
-                    "distributed_epoch_complete | epoch=%d/%d | step=%d | loss=%.4f | kl=%.4f",
+                    "distributed_epoch_complete | epoch=%d/%d | step=%d | loss=%.4f | kl=%.4f | epoch_avg_loss=%s | global_opt_steps=%d | max_grad_norm=%.6f",
                     epoch + 1,
-                    settings.ppo_epochs,
+                    max_epochs,
                     training_step,
                     last_loss,
                     last_kl,
+                    (
+                        f"{epoch_avg_loss:.6f}"
+                        if epoch_avg_loss is not None
+                        else "n/a"
+                    ),
+                    int(global_optimizer_steps),
+                    global_max_grad_norm,
                 )
 
             if kl_controller.last_kl > settings.max_abs_kl_for_update:
@@ -490,6 +521,81 @@ def main() -> None:
                         epoch + 1,
                         kl_controller.last_kl,
                         settings.max_abs_kl_for_update,
+                    )
+                break
+
+            if not settings.dynamic_iteration_enabled:
+                continue
+
+            if (epoch + 1) < min_epochs:
+                if epoch_avg_loss is not None:
+                    prev_epoch_avg_loss = epoch_avg_loss
+                continue
+
+            if int(global_optimizer_steps) <= 0:
+                if rank == 0:
+                    logger.warning(
+                        "distributed_dynamic_stop | reason=no_optimizer_steps | epoch=%d | min_epochs=%d",
+                        epoch + 1,
+                        min_epochs,
+                    )
+                break
+
+            if epoch_avg_loss is None:
+                if rank == 0:
+                    logger.warning(
+                        "distributed_dynamic_stop | reason=no_finite_epoch_loss | epoch=%d",
+                        epoch + 1,
+                    )
+                break
+
+            if prev_epoch_avg_loss is not None:
+                loss_improvement = abs(prev_epoch_avg_loss - epoch_avg_loss)
+                if loss_improvement < settings.dynamic_loss_improvement_threshold:
+                    low_improvement_streak += 1
+                else:
+                    low_improvement_streak = 0
+            else:
+                loss_improvement = float("inf")
+
+            if global_max_grad_norm < settings.dynamic_grad_norm_floor:
+                low_grad_streak += 1
+            else:
+                low_grad_streak = 0
+
+            if rank == 0:
+                logger.info(
+                    "distributed_dynamic_diag | epoch=%d/%d | min_epochs=%d | epoch_avg_loss=%.6f | loss_improvement=%.6f | max_grad_norm=%.6f | low_improvement_streak=%d | low_grad_streak=%d | patience=%d",
+                    epoch + 1,
+                    max_epochs,
+                    min_epochs,
+                    epoch_avg_loss,
+                    loss_improvement,
+                    global_max_grad_norm,
+                    low_improvement_streak,
+                    low_grad_streak,
+                    settings.dynamic_patience,
+                )
+
+            prev_epoch_avg_loss = epoch_avg_loss
+
+            if low_improvement_streak >= settings.dynamic_patience:
+                if rank == 0:
+                    logger.info(
+                        "distributed_dynamic_stop | reason=loss_plateau | epoch=%d | streak=%d | threshold=%.6f",
+                        epoch + 1,
+                        low_improvement_streak,
+                        settings.dynamic_loss_improvement_threshold,
+                    )
+                break
+
+            if low_grad_streak >= settings.dynamic_patience:
+                if rank == 0:
+                    logger.info(
+                        "distributed_dynamic_stop | reason=low_grad_norm | epoch=%d | streak=%d | floor=%.6f",
+                        epoch + 1,
+                        low_grad_streak,
+                        settings.dynamic_grad_norm_floor,
                     )
                 break
 

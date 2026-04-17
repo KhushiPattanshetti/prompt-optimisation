@@ -57,3 +57,5 @@ data/*.xlsx
 scripts/__pycache__/
 
 .cursor/
+
+run_results/

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from typing import List
 
 from fastapi import FastAPI
 
@@ -65,6 +66,25 @@ def generate_codes(request: CodeRequest):
         )
 
     return CodeResponse(**result)
+
+
+@app.post("/generate_codes_batch", response_model=List[CodeResponse])
+def generate_codes_batch(requests: List[CodeRequest]):
+    responses: List[CodeResponse] = []
+    for request in requests:
+        result = inference_engine.run_inference(
+            note_id=request.note_id,
+            run_id=request.run_id,
+            group_id=request.group_id,
+            original_prompt=request.original_prompt,
+            rewritten_prompt=request.rewritten_prompt,
+            generation_source=request.generation_source,
+            log_prob_old=request.log_prob_old,
+            value_estimate=request.value_estimate,
+            skip_reward_forward=request.skip_reward_forward,
+        )
+        responses.append(CodeResponse(**result))
+    return responses
 
 
 @app.get("/health")

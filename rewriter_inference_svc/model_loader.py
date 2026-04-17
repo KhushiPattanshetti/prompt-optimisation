@@ -193,13 +193,31 @@ def load_model() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Module]:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-    )
+    base_model: PreTrainedModel
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
+    except NotImplementedError as exc:
+        # Recover from occasional accelerate meta-tensor dispatch failures by
+        # pinning weights to the single visible CUDA device explicitly.
+        if "meta tensor" not in str(exc).lower() or not torch.cuda.is_available():
+            raise
+        log.warning(
+            "Retrying model load with explicit single-GPU device map after meta-tensor failure"
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map={"": 0},
+            low_cpu_mem_usage=False,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        )
     base_model.config.use_cache = True
 
     checkpoint_dir = _find_latest_checkpoint_dir() if REWRITER_LOAD_LOCAL_CHECKPOINTS else None

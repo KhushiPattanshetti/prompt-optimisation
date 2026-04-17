@@ -31,7 +31,6 @@ class TestRolloutLoaderBufferIntegration:
             )
             buf.store(
                 e.reward,
-                e.concept_reward if e.concept_reward is not None else e.reward,
                 e.log_prob_old,
                 value_estimate,
                 e.group_id or "g_default",
@@ -93,7 +92,6 @@ class TestRolloutLoaderBufferIntegration:
             )
             buf.store(
                 e.reward,
-                e.concept_reward if e.concept_reward is not None else e.reward,
                 e.log_prob_old,
                 value_estimate,
                 e.group_id or "g_default",

@@ -34,12 +34,6 @@ class RolloutEntry(BaseModel):
     reward: float = Field(
         ..., ge=-1.0, le=1.0, description="Scalar reward from Reward Metrics Service"
     )
-    concept_reward: Optional[float] = Field(
-        default=None,
-        ge=-1.0,
-        le=1.0,
-        description="Optional concept-level dense reward signal",
-    )
     sample_weight: Optional[float] = Field(
         default=None,
         ge=0.0,

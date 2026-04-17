@@ -241,7 +241,7 @@ Primary rollout schemas:
 - RolloutEntry:
   - identity: rollout_id, run_id, group_id
   - state/action text: original_prompt, rewritten_prompt
-  - learning targets: reward, concept_reward, sample_weight
+  - learning targets: reward, sample_weight
   - behavior/value: log_prob_old, value_estimate
 - RolloutFile: run_id + rollouts[]
 

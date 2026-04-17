@@ -19,7 +19,6 @@ class RolloutBatch:
     values: torch.Tensor  # (N,)
     advantages: torch.Tensor  # (N,) — filled by advantage estimator
     returns: torch.Tensor  # (N,) — advantage + value baseline
-    concept_rewards: torch.Tensor  # (N,)
     sample_weights: torch.Tensor  # (N,)
     original_prompts: List[str] = field(default_factory=list)
     rewritten_prompts: List[str] = field(default_factory=list)
@@ -45,7 +44,6 @@ class RolloutBuffer:
     def __init__(self, device: str = "cpu") -> None:
         self.device = device
         self._rewards: List[float] = []
-        self._concept_rewards: List[float] = []
         self._sample_weights: List[float] = []
         self._log_probs_old: List[float] = []
         self._values: List[float] = []
@@ -62,7 +60,6 @@ class RolloutBuffer:
     def store(
         self,
         reward: float,
-        concept_reward: float,
         log_prob_old: float,
         value_estimate: float,
         group_id: str,
@@ -76,7 +73,6 @@ class RolloutBuffer:
     ) -> None:
         """Append a single trajectory step to the buffer."""
         self._rewards.append(reward)
-        self._concept_rewards.append(concept_reward)
         self._sample_weights.append(sample_weight)
         self._log_probs_old.append(log_prob_old)
         self._values.append(value_estimate)
@@ -99,12 +95,7 @@ class RolloutBuffer:
             RolloutBatch ready for PPO updates.
         """
         rewards = torch.tensor(self._rewards, dtype=torch.float32, device=self.device)
-        concept_rewards = torch.tensor(
-            self._concept_rewards, dtype=torch.float32, device=self.device
-        )
-        sample_weights = torch.tensor(
-            self._sample_weights, dtype=torch.float32, device=self.device
-        )
+        sample_weights = torch.tensor(self._sample_weights, dtype=torch.float32, device=self.device)
         log_probs_old = torch.tensor(
             self._log_probs_old, dtype=torch.float32, device=self.device
         )
@@ -118,7 +109,6 @@ class RolloutBuffer:
             values=values,
             advantages=advantages_on_device,
             returns=returns,
-            concept_rewards=concept_rewards,
             sample_weights=sample_weights,
             original_prompts=list(self._original_prompts),
             rewritten_prompts=list(self._rewritten_prompts),
@@ -132,7 +122,6 @@ class RolloutBuffer:
     def clear(self) -> None:
         """Reset the buffer for the next collection phase."""
         self._rewards.clear()
-        self._concept_rewards.clear()
         self._sample_weights.clear()
         self._log_probs_old.clear()
         self._values.clear()

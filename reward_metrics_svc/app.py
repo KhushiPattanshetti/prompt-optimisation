@@ -12,8 +12,9 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from typing import Any, Dict
 
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 
 from . import tree as _tree
 from .config import ALPHA, BETA, GAMMA, DELTA, LAMBDA_EXTRA, LAMBDA_CARD
@@ -32,6 +33,9 @@ from .schemas import (
 )
 
 logger = logging.getLogger("reward_metrics_svc.app")
+_OBS: Dict[str, int] = {
+    "reward_calls": 0,
+}
 
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -82,6 +86,7 @@ app = FastAPI(title="reward_metrics_svc", version="3.0.0", lifespan=_lifespan)
 
 @app.post("/compute_reward", response_model=RewardResponse)
 def compute_reward_endpoint(req: RewardRequest) -> RewardResponse:
+    _OBS["reward_calls"] += 1
     # ── 1. Deduplicate (spec §4) ───────────────────────────────────────────────
     gt = list({c.upper() for c in req.gt_codes})
     enh = list({c.upper() for c in req.enh_codes})
@@ -186,6 +191,64 @@ def compute_reward_endpoint(req: RewardRequest) -> RewardResponse:
             diagnostics=Diagnostics(**diag),
         ),
     )
+
+
+@app.post("/reward")
+def legacy_reward_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Backward-compatible endpoint used by older orchestrator and ICD services."""
+    note_id = str(payload.get("note_id") or "unknown")
+    gt = list(payload.get("gt_codes") or [])
+    enh = list(payload.get("enh_codes") or [])
+    org = list(payload.get("org_codes") or [])
+    invalid = list(payload.get("invalid_codes") or [])
+    duplicates = list(payload.get("duplicate_codes") or [])
+    parsing_success = bool(payload.get("parsing_success", True))
+
+    reward, metrics = compute_reward(
+        gt,
+        enh,
+        org,
+        invalid_codes=invalid,
+        duplicate_codes=duplicates,
+        parsing_success=parsing_success,
+    )
+    _OBS["reward_calls"] += 1
+    return {
+        "note_id": note_id,
+        "reward": reward,
+        "metrics": metrics,
+    }
+
+
+@app.get("/observability")
+def observability_get() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        **_OBS,
+    }
+
+
+@app.post("/observability/reset")
+def observability_reset() -> Dict[str, Any]:
+    _OBS["reward_calls"] = 0
+    return {"status": "ok"}
+
+
+@app.get("/queue/status")
+def queue_status() -> Dict[str, Any]:
+    return {
+        "pending_count": 0,
+        "acked_count": 0,
+        "failed_count": 0,
+    }
+
+
+@app.post("/queue/flush")
+def queue_flush() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "pending_count": 0,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

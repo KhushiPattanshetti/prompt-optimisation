@@ -97,17 +97,18 @@ def group_reward_std_mean(
 
 
 def select_rollout_batch(batch: RolloutBatch, keep_idx: torch.Tensor) -> RolloutBatch:
+    # Align index tensor device with rollout tensors to avoid CPU/CUDA indexing mismatches.
+    idx_tensor = keep_idx.to(device=batch.rewards.device)
     idx_list = [int(v) for v in keep_idx.detach().cpu().tolist()]
     return RolloutBatch(
-        rewards=batch.rewards[keep_idx],
-        log_probs_old=batch.log_probs_old[keep_idx],
-        values=batch.values[keep_idx],
-        advantages=batch.advantages[keep_idx],
-        returns=batch.returns[keep_idx],
-        sample_weights=batch.sample_weights[keep_idx],
+        rewards=batch.rewards[idx_tensor],
+        log_probs_old=batch.log_probs_old[idx_tensor],
+        values=batch.values[idx_tensor],
+        advantages=batch.advantages[idx_tensor],
+        returns=batch.returns[idx_tensor],
+        sample_weights=batch.sample_weights[idx_tensor],
         original_prompts=[batch.original_prompts[i] for i in idx_list],
         rewritten_prompts=[batch.rewritten_prompts[i] for i in idx_list],
-        concept_rewards=batch.concept_rewards[keep_idx],
         group_ids=[batch.group_ids[i] for i in idx_list],
     )
 

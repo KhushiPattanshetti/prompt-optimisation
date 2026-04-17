@@ -17,6 +17,14 @@ class RewriteRequest(BaseModel):
         min_length=1,
         description="Clinical note text to be rewritten.",
     )
+    sampling_nonce: Optional[int] = Field(
+        default=None,
+        description="Optional integer used to diversify retry decoding behavior.",
+    )
+    disable_best_prompt_cache: bool = Field(
+        default=False,
+        description="Skip best-prompt cache lookup for this request when true.",
+    )
 
 
 class RewriteResponse(BaseModel):
@@ -37,4 +45,12 @@ class RewriteResponse(BaseModel):
     generation_source: str = Field(
         ...,
         description="Source of rewrite generation (model, cache, guided fallback, or rule fallback).",
+    )
+    rejection_reason: Optional[str] = Field(
+        default=None,
+        description="Validation rejection reason that triggered fallback, when applicable.",
+    )
+    rejection_reason_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Process-local aggregate counts of rewrite rejection reasons.",
     )

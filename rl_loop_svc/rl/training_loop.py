@@ -9,7 +9,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import torch
@@ -59,7 +59,14 @@ def _select_optional_tensor(
 ) -> Optional[torch.Tensor]:
     if tensor is None:
         return None
-    return tensor[keep_idx]
+    return tensor[keep_idx.to(device=tensor.device)]
+
+
+def _select_tensor(
+    tensor: torch.Tensor,
+    keep_idx: torch.Tensor,
+) -> torch.Tensor:
+    return tensor[keep_idx.to(device=tensor.device)]
 
 
 def _fuse_action_attention_mask(
@@ -120,6 +127,92 @@ class TrainingLoop:
         self.last_train_error: Optional[str] = None
         self.last_train_started_at: Optional[str] = None
         self.last_train_finished_at: Optional[str] = None
+        self._mbmi_group_buffer: List[Tuple[str, List[RolloutEntry]]] = []
+        self._sbmi_validation_passed: bool = False
+
+    @staticmethod
+    def _is_finite(value: float) -> bool:
+        return math.isfinite(float(value))
+
+    @staticmethod
+    def _is_valid_log_prob_old(value: float) -> bool:
+        # Log-probabilities are commonly non-positive; only require finite and non-zero.
+        return math.isfinite(float(value)) and abs(float(value)) > 1e-12
+
+    def _assert_hybrid_runtime_ready(self, entries: List[RolloutEntry]) -> None:
+        if not settings.hybrid_mode_enforced:
+            return
+
+        if not settings.grpo_enabled:
+            raise RuntimeError("Hybrid enforcement failed: RL_GRPO_ENABLED must be true")
+        if not settings.value_head_enabled:
+            raise RuntimeError("Hybrid enforcement failed: RL_VALUE_HEAD_ENABLED must be true")
+        if self.value_head is None:
+            raise RuntimeError("Hybrid enforcement failed: value head is not initialized")
+
+        for idx, entry in enumerate(entries):
+            if entry.value_estimate is None:
+                raise RuntimeError(
+                    f"Hybrid enforcement failed: value_estimate missing at entry {idx}"
+                )
+            if not str(entry.group_id or "").strip():
+                raise RuntimeError(
+                    f"Hybrid enforcement failed: group_id missing at entry {idx}"
+                )
+            if not self._is_valid_log_prob_old(float(entry.log_prob_old)):
+                raise RuntimeError(
+                    f"Hybrid enforcement failed: invalid log_prob_old at entry {idx}"
+                )
+
+    def _validate_group_guardrails(
+        self, group_id: str, entries: List[RolloutEntry]
+    ) -> Tuple[bool, Dict[str, float]]:
+        if not entries:
+            return False, {
+                "rollout_count": 0,
+                "unique_action_count": 0,
+                "dropped_count": 0,
+                "group_validity": False,
+            }
+
+        state_set = {str(e.original_prompt) for e in entries}
+        action_set = {str(e.rewritten_prompt) for e in entries}
+        finite_reward = [self._is_finite(float(e.reward)) for e in entries]
+        valid_logp = [self._is_valid_log_prob_old(float(e.log_prob_old)) for e in entries]
+        has_group = [str(e.group_id or "").strip() != "" for e in entries]
+
+        group_validity = (
+            len(state_set) == 1
+            and len(action_set) >= 2
+            and all(finite_reward)
+            and all(valid_logp)
+            and all(has_group)
+        )
+        dropped_count = int(len(entries) - len(action_set))
+        diag = {
+            "rollout_count": float(len(entries)),
+            "unique_action_count": float(len(action_set)),
+            "dropped_count": float(max(dropped_count, 0)),
+            "group_validity": 1.0 if group_validity else 0.0,
+        }
+        logger.info(
+            "group_guardrail_diag | group_id=%s | rollout_count=%d | unique_action_count=%d | dropped_count=%d | group_validity=%s",
+            group_id,
+            len(entries),
+            len(action_set),
+            max(dropped_count, 0),
+            group_validity,
+        )
+        return group_validity, diag
+
+    def _group_entries(self, entries: List[RolloutEntry]) -> List[Tuple[str, List[RolloutEntry]]]:
+        grouped: Dict[str, List[RolloutEntry]] = {}
+        for entry in entries:
+            key = str(entry.group_id or "").strip()
+            if not key:
+                key = f"missing_group:{entry.run_id or 'default'}"
+            grouped.setdefault(key, []).append(entry)
+        return sorted(grouped.items(), key=lambda item: item[0])
 
     def run_once(self) -> bool:
         self.lifecycle.transition(TrainerState.COLLECT)
@@ -129,12 +222,12 @@ class TrainingLoop:
             self.lifecycle.transition(TrainerState.IDLE)
             return False
 
+        self._assert_hybrid_runtime_ready(entries)
+
         self.rollouts_loaded += len(entries)
-        self.batch_counter += 1
 
         if _PRETTY_LOG:
             _rl_io.log_input(
-                batch_num=self.batch_counter,
                 n_entries=len(entries),
                 mode2=resolve_mode2(settings.ppo_epochs),
             )
@@ -154,17 +247,90 @@ class TrainingLoop:
             self.buffer.clear()
             return True
 
-        self._fill_buffer(entries)
+        grouped_entries = self._group_entries(entries)
+        valid_groups: List[Tuple[str, List[RolloutEntry]]] = []
+        for group_id, group_items in grouped_entries:
+            is_valid, _ = self._validate_group_guardrails(group_id, group_items)
+            if not is_valid:
+                logger.warning(
+                    "group_guardrail_drop | group_id=%s | reason=validation_failed",
+                    group_id,
+                )
+                continue
+            valid_groups.append((group_id, group_items))
+
+        if not valid_groups:
+            self.lifecycle.transition(TrainerState.IDLE)
+            return False
 
         self.lifecycle.transition(TrainerState.TRAIN)
-        self._run_ppo_epochs()
+
+        if settings.mbmi_enabled:
+            if not self._sbmi_validation_passed:
+                raise RuntimeError(
+                    "MBMi enabled before SBMi validation passed"
+                )
+            self._mbmi_group_buffer.extend(valid_groups)
+            if len(self._mbmi_group_buffer) < max(settings.mbmi_training_batch_size, 1):
+                logger.info(
+                    "mbmi_buffering | buffered_groups=%d | required_groups=%d",
+                    len(self._mbmi_group_buffer),
+                    max(settings.mbmi_training_batch_size, 1),
+                )
+                self.lifecycle.transition(TrainerState.IDLE)
+                return False
+
+            consume_n = max(settings.mbmi_training_batch_size, 1)
+            groups_to_train = self._mbmi_group_buffer[:consume_n]
+            self._mbmi_group_buffer = self._mbmi_group_buffer[consume_n:]
+
+            for mbmi_epoch in range(max(settings.mbmi_epochs, 1)):
+                for group_id, group_items in groups_to_train:
+                    self.batch_counter += 1
+                    self._fill_buffer(group_items)
+                    pre_step = int(self.training_step)
+                    self._run_ppo_epochs(
+                        sbmi_iteration_index=mbmi_epoch + 1,
+                        sbmi_iteration_total=max(settings.mbmi_epochs, 1),
+                        group_id=group_id,
+                    )
+                    if int(self.training_step) <= pre_step:
+                        raise RuntimeError(
+                            f"MBMi effectiveness guard failed for group_id={group_id}"
+                        )
+                    if not math.isfinite(float(self.last_loss)):
+                        raise RuntimeError(
+                            f"MBMi finite-loss guard failed for group_id={group_id}"
+                        )
+                    self.buffer.clear()
+        else:
+            for group_id, group_items in valid_groups:
+                self.batch_counter += 1
+                self._fill_buffer(group_items)
+                pre_step = int(self.training_step)
+                sbmi_iters = max(settings.sbmi_epochs, 1) if settings.sbmi_enabled else 1
+                for sbmi_iter in range(sbmi_iters):
+                    self._run_ppo_epochs(
+                        sbmi_iteration_index=sbmi_iter + 1,
+                        sbmi_iteration_total=sbmi_iters,
+                        group_id=group_id,
+                    )
+                if int(self.training_step) <= pre_step:
+                    raise RuntimeError(
+                        f"SBMi effectiveness guard failed for group_id={group_id}"
+                    )
+                if not math.isfinite(float(self.last_loss)):
+                    raise RuntimeError(
+                        f"SBMi finite-loss guard failed for group_id={group_id}"
+                    )
+                self._sbmi_validation_passed = True
+                self.buffer.clear()
 
         self.lifecycle.transition(TrainerState.CHECKPOINT)
         self._save_checkpoint()
         self._notify_rewriter_reload()
 
         self.lifecycle.transition(TrainerState.IDLE)
-        self.buffer.clear()
         return True
 
     # ── Buffer fill with ValueHead inference ────────────────────────────────
@@ -178,32 +344,18 @@ class TrainingLoop:
         value_estimates = self._compute_value_estimates(originals)
 
         for idx, entry in enumerate(entries):
-            concept_reward = (
-                float(entry.concept_reward)
-                if entry.concept_reward is not None
-                else float(entry.reward)
-            )
-            # group_id and sample_weight are pre-computed by trajectory_store_svc
-            # (processing/preprocessing.py) — use them directly without recomputing.
-            group_id = (
-                entry.group_id or f"g_{abs(hash(entry.original_prompt)) % (2**32):08x}"
-            )
-            sample_weight = (
-                float(entry.sample_weight) if entry.sample_weight is not None else 1.0
-            )
             self.buffer.store(
                 reward=entry.reward,
                 log_prob_old=entry.log_prob_old,
                 value_estimate=value_estimates[idx],
                 original_prompt=entry.original_prompt,
                 rewritten_prompt=entry.rewritten_prompt,
-                concept_reward=concept_reward,
-                group_id=group_id,
-                sample_weight=sample_weight,
-                rollout_id=entry.rollout_id or "",
-                og_codes=list(entry.og_codes),
-                enh_codes=list(entry.enh_codes),
-                gt_codes=list(entry.gt_codes),
+                group_id=str(entry.group_id or f"group_{idx}"),
+                sample_weight=float(entry.sample_weight if entry.sample_weight is not None else 1.0),
+                rollout_id=str(entry.rollout_id or ""),
+                og_codes=list(entry.og_codes or []),
+                enh_codes=list(entry.enh_codes or []),
+                gt_codes=list(entry.gt_codes or []),
             )
 
     def _compute_value_estimates(self, prompts: List[str]) -> List[float]:
@@ -228,7 +380,12 @@ class TrainingLoop:
 
     # ── Core GRPO/PPO training ──────────────────────────────────────────────
 
-    def _run_ppo_epochs(self) -> None:
+    def _run_ppo_epochs(
+        self,
+        sbmi_iteration_index: int = 1,
+        sbmi_iteration_total: int = 1,
+        group_id: str = "",
+    ) -> None:
         if self.policy_model is None or self.reference_model is None:
             raise RuntimeError(
                 "Local GRPO run requested without initialized model components"
@@ -236,14 +393,7 @@ class TrainingLoop:
         if self.optimizer is None:
             raise RuntimeError("Local GRPO run requested without optimizer")
 
-        final_rewards = torch.tensor(self.buffer._rewards, dtype=torch.float32)
-        concept_rewards = torch.tensor(
-            self.buffer._concept_rewards, dtype=torch.float32
-        )
-        rewards = (
-            settings.final_reward_beta * final_rewards
-            + settings.concept_reward_alpha * concept_rewards
-        )
+        rewards = torch.tensor(self.buffer._rewards, dtype=torch.float32)
 
         effective_group_ids = resolve_grpo_group_ids(
             self.buffer._group_ids,
@@ -362,12 +512,10 @@ class TrainingLoop:
                 )
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
-            current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(
-                current_attention_mask, keep_idx
-            )
-            current_fused_mask = current_fused_mask[keep_idx]
-            current_fallback_mask = current_fallback_mask[keep_idx]
+            current_input_ids = _select_tensor(current_input_ids, keep_idx)
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = _select_tensor(current_fused_mask, keep_idx)
+            current_fallback_mask = _select_tensor(current_fallback_mask, keep_idx)
 
         finite_reward_mask = torch.isfinite(current_batch.rewards)
         dropped_nan = int((~finite_reward_mask).sum().item())
@@ -378,12 +526,10 @@ class TrainingLoop:
                 logger.warning("grpo_skip | reason=all_rewards_non_finite")
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
-            current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(
-                current_attention_mask, keep_idx
-            )
-            current_fused_mask = current_fused_mask[keep_idx]
-            current_fallback_mask = current_fallback_mask[keep_idx]
+            current_input_ids = _select_tensor(current_input_ids, keep_idx)
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = _select_tensor(current_fused_mask, keep_idx)
+            current_fallback_mask = _select_tensor(current_fallback_mask, keep_idx)
 
         finite_adv_mask = torch.isfinite(current_batch.advantages)
         dropped_adv = int((~finite_adv_mask).sum().item())
@@ -394,12 +540,10 @@ class TrainingLoop:
                 logger.warning("grpo_skip | reason=all_advantages_non_finite")
                 return
             current_batch = select_rollout_batch(current_batch, keep_idx)
-            current_input_ids = current_input_ids[keep_idx]
-            current_attention_mask = _select_optional_tensor(
-                current_attention_mask, keep_idx
-            )
-            current_fused_mask = current_fused_mask[keep_idx]
-            current_fallback_mask = current_fallback_mask[keep_idx]
+            current_input_ids = _select_tensor(current_input_ids, keep_idx)
+            current_attention_mask = _select_optional_tensor(current_attention_mask, keep_idx)
+            current_fused_mask = _select_tensor(current_fused_mask, keep_idx)
+            current_fallback_mask = _select_tensor(current_fallback_mask, keep_idx)
 
         n = len(current_batch.rewritten_prompts)
         if n == 0:
@@ -412,12 +556,10 @@ class TrainingLoop:
                 device=current_input_ids.device,
             )
             current_batch = select_rollout_batch(current_batch, expand_idx)
-            current_input_ids = current_input_ids[expand_idx]
-            current_attention_mask = _select_optional_tensor(
-                current_attention_mask, expand_idx
-            )
-            current_fused_mask = current_fused_mask[expand_idx]
-            current_fallback_mask = current_fallback_mask[expand_idx]
+            current_input_ids = _select_tensor(current_input_ids, expand_idx)
+            current_attention_mask = _select_optional_tensor(current_attention_mask, expand_idx)
+            current_fused_mask = _select_tensor(current_fused_mask, expand_idx)
+            current_fallback_mask = _select_tensor(current_fallback_mask, expand_idx)
             n = len(current_batch.rewritten_prompts)
 
         # ── Hoist: compute reference log-probs once ─────────────────────────
@@ -453,13 +595,25 @@ class TrainingLoop:
             )
 
         # ── Epoch loop (only gradient updates, everything else precomputed) ─
-        for epoch in range(settings.ppo_epochs):
+        min_epochs = max(1, int(settings.dynamic_min_epochs))
+        max_epochs = max(min_epochs, int(settings.ppo_epochs))
+        if not settings.dynamic_iteration_enabled:
+            min_epochs = max_epochs
+
+        prev_epoch_avg_loss: Optional[float] = None
+        low_improvement_streak = 0
+        low_grad_streak = 0
+
+        for epoch in range(max_epochs):
             grad_norm: float = 0.0
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
+            epoch_max_grad_norm = 0.0
 
             # ── Pretty system log (CSV + ASCII table) ───────────────────────
             if _PRETTY_LOG:
                 _mode1 = resolve_mode1(settings.grpo_enabled, has_value_estimates)
-                _mode2 = resolve_mode2(settings.ppo_epochs)
+                _mode2 = resolve_mode2(max_epochs)
                 _, _run_id = get_run_context()
                 _run_id = _run_id or "unknown"
                 _ts = datetime.now(timezone.utc).isoformat()
@@ -472,7 +626,7 @@ class TrainingLoop:
                         "batch_num": self.batch_counter,
                         "iter_num": epoch + 1,
                         "batch_size": loaded_batch_size,
-                        "max_iters": settings.ppo_epochs,
+                        "max_iters": max_epochs,
                         "rollout_id": (
                             current_batch.rollout_ids[i]
                             if i < len(current_batch.rollout_ids)
@@ -508,7 +662,7 @@ class TrainingLoop:
                     mode2=_mode2,
                     batch_num=self.batch_counter,
                     iter_num=epoch + 1,
-                    max_iters=settings.ppo_epochs,
+                    max_iters=max_epochs,
                     batch_size=loaded_batch_size,
                     entries=_log_entries,
                 )
@@ -577,11 +731,8 @@ class TrainingLoop:
                     vl_clipped = (value_pred_clipped - returns_mb).pow(2)
                     value_loss = 0.5 * torch.max(vl_unclipped, vl_clipped).mean()
 
-                old_log_prob_mb = current_batch.log_probs_old[start:end]
-                if (
-                    not torch.isfinite(seq_log_prob_new).all()
-                    or not torch.isfinite(old_log_prob_mb).all()
-                ):
+                old_log_prob_mb = current_batch.log_probs_old[start:end].to(seq_log_prob_new.device)
+                if not torch.isfinite(seq_log_prob_new).all() or not torch.isfinite(old_log_prob_mb).all():
                     logger.warning(
                         "grpo_minibatch_skip | epoch=%d | start=%d | end=%d | reason=non_finite_log_prob",
                         epoch + 1,
@@ -596,8 +747,8 @@ class TrainingLoop:
                 ref_mb = ref_log_probs[start:end].to(seq_log_prob_new.device)
                 kl_penalty = self.kl_controller.compute_kl(seq_log_prob_new, ref_mb)
 
-                adv_mb = current_batch.advantages[start:end]
-                fallback_mb = current_fallback_mask[start:end]
+                adv_mb = current_batch.advantages[start:end].to(seq_log_prob_new.device)
+                fallback_mb = current_fallback_mask[start:end].to(seq_log_prob_new.device)
                 sample_weights = torch.clamp(
                     current_batch.sample_weights[start:end].to(seq_log_prob_new.device),
                     min=0.0,
@@ -655,8 +806,13 @@ class TrainingLoop:
                     self.optimizer.zero_grad()
                     epoch_diag["optimizer_steps"] += 1
                     self.training_step += 1
+                    grad_norm_float = float(grad_norm)
+                    if math.isfinite(grad_norm_float):
+                        epoch_max_grad_norm = max(epoch_max_grad_norm, grad_norm_float)
 
                 self.last_loss = float(total_loss.detach().item())
+                epoch_loss_sum += self.last_loss
+                epoch_loss_count += 1
                 logger.info(
                     "grpo_loss_diag | epoch=%d | start=%d | end=%d | policy=%.6f | kl=%.6f | value=%.6f | entropy=%.6f | total=%.6f | grad_norm=%.4f | ratio_max=%.4f | fallback=%d/%d",
                     epoch + 1,
@@ -678,12 +834,16 @@ class TrainingLoop:
                 )
 
             logger.info(
-                "GRPO Epoch %d/%d | step=%d | loss=%.4f | KL=%.4f | group_reward_std=%.4f | advantage_mean=%.4f | advantage_std=%.4f | batch=%d | filtered=%d | fallback=%d | opt_steps=%d",
+                "GRPO Epoch %d/%d | sbmi_iter=%d/%d | group_id=%s | step=%d | loss=%.4f | KL=%.4f | reward_mean=%.4f | group_reward_std=%.4f | advantage_mean=%.4f | advantage_std=%.4f | batch=%d | filtered=%d | fallback=%d | opt_steps=%d",
                 epoch + 1,
                 settings.ppo_epochs,
+                sbmi_iteration_index,
+                sbmi_iteration_total,
+                group_id or "n/a",
                 self.training_step,
                 self.last_loss,
                 self.kl_controller.last_kl,
+                float(current_batch.rewards.mean().item()) if len(current_batch.rewards) else 0.0,
                 group_reward_std,
                 (
                     float(current_batch.advantages.mean().item())
@@ -701,6 +861,12 @@ class TrainingLoop:
                 epoch_diag["optimizer_steps"],
             )
 
+            epoch_avg_loss = (
+                float(epoch_loss_sum / epoch_loss_count)
+                if epoch_loss_count > 0
+                else None
+            )
+
             # KL early stopping
             if self.kl_controller.last_kl > settings.max_abs_kl_for_update:
                 logger.warning(
@@ -708,6 +874,76 @@ class TrainingLoop:
                     epoch + 1,
                     self.kl_controller.last_kl,
                     settings.max_abs_kl_for_update,
+                )
+                break
+
+            if not settings.dynamic_iteration_enabled:
+                continue
+
+            if (epoch + 1) < min_epochs:
+                if epoch_avg_loss is not None:
+                    prev_epoch_avg_loss = epoch_avg_loss
+                continue
+
+            if epoch_diag["optimizer_steps"] <= 0:
+                logger.warning(
+                    "grpo_dynamic_stop | reason=no_optimizer_steps | epoch=%d | min_epochs=%d",
+                    epoch + 1,
+                    min_epochs,
+                )
+                break
+
+            if epoch_avg_loss is None:
+                logger.warning(
+                    "grpo_dynamic_stop | reason=no_finite_epoch_loss | epoch=%d",
+                    epoch + 1,
+                )
+                break
+
+            if prev_epoch_avg_loss is not None:
+                loss_improvement = abs(prev_epoch_avg_loss - epoch_avg_loss)
+                if loss_improvement < settings.dynamic_loss_improvement_threshold:
+                    low_improvement_streak += 1
+                else:
+                    low_improvement_streak = 0
+            else:
+                loss_improvement = float("inf")
+
+            if epoch_max_grad_norm < settings.dynamic_grad_norm_floor:
+                low_grad_streak += 1
+            else:
+                low_grad_streak = 0
+
+            logger.info(
+                "grpo_dynamic_diag | epoch=%d/%d | min_epochs=%d | epoch_avg_loss=%.6f | loss_improvement=%.6f | max_grad_norm=%.6f | low_improvement_streak=%d | low_grad_streak=%d | patience=%d",
+                epoch + 1,
+                max_epochs,
+                min_epochs,
+                epoch_avg_loss,
+                loss_improvement,
+                epoch_max_grad_norm,
+                low_improvement_streak,
+                low_grad_streak,
+                settings.dynamic_patience,
+            )
+
+            prev_epoch_avg_loss = epoch_avg_loss
+
+            if low_improvement_streak >= settings.dynamic_patience:
+                logger.info(
+                    "grpo_dynamic_stop | reason=loss_plateau | epoch=%d | streak=%d | threshold=%.6f",
+                    epoch + 1,
+                    low_improvement_streak,
+                    settings.dynamic_loss_improvement_threshold,
+                )
+                break
+
+            if low_grad_streak >= settings.dynamic_patience:
+                logger.info(
+                    "grpo_dynamic_stop | reason=low_grad_norm | epoch=%d | streak=%d | floor=%.6f",
+                    epoch + 1,
+                    low_grad_streak,
+                    settings.dynamic_grad_norm_floor,
                 )
                 break
 
