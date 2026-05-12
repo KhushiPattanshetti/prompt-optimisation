@@ -1,6 +1,10 @@
 # Model checkpoints (never commit weights to git)
 rl_checkpoints/
 sft_checkpoints/
+rl_checkpoints_bak_*/
+best_checkpoint/
+best_checkpoint*/
+saved_weights/
 
 # Python bytecode
 __pycache__/
@@ -32,6 +36,8 @@ hf_cache/
 inference_outputs/
 reward_queue/
 reward_metrics_svc/icd10_tree.json
+best_prompts_cache/
+trajectory_store_svc/trajectory_store/
 
 # Pretty pipeline logs (runtime artefacts, never commit)
 pipeline_logs/
@@ -40,13 +46,42 @@ pipeline_logs/
 rl_loop_svc/rollouts/*.jsonl
 rl_loop_svc/rollouts/.seen_files
 rl_loop_svc/rollouts/.seen_rollout_ids
+rl_loop_svc/rollouts/**/*.jsonl
 
 # Generated reports/logs from local validation runs
 logs/
+reports/
+run_results/
 
 # Local data downloads and exports
 gt_codes/
 data/*.xlsx
+data/*.csv
+
+# Global runtime/log artifacts
+*.log
+*.log.*
+*.out
+*.err
+logs/
+**/logs/
+**/log/
+
+# Large/binary/non-code artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.h5
+*.npz
+*.npy
+*.parquet
+*.feather
+*.jsonl
+*.sqlite
+*.db
 
 # Environment/config secrets
 .env
