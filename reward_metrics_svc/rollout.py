@@ -71,8 +71,8 @@ def enqueue_rollout(
     """
     payload = {
         "note_id": note_id,
-        "state": state,
-        "action": action,
+        "original_prompt": state,
+        "rewritten_prompt": action,
         "reward": reward,
         "log_prob_old": log_prob_old,
         "value_estimate": value_estimate,

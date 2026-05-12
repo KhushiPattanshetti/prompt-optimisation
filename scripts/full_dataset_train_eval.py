@@ -262,6 +262,16 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Reset reward observability counters at run start (recommended for gate runs).",
     )
+    p.add_argument(
+        "--rl-checkpoint-dir",
+        default="./rl_checkpoints",
+        help="Host-side path to the RL checkpoint directory written by rl_loop_svc.",
+    )
+    p.add_argument(
+        "--best-checkpoint-dir",
+        default="./best_checkpoint",
+        help="Directory where the best-performing checkpoint is kept (never auto-pruned).",
+    )
     return p.parse_args()
 
 
@@ -536,6 +546,84 @@ def flush_and_wait_reward_queue(session: requests.Session, reward_url: str, time
     return {"pending_count": 0}
 
 
+def _maybe_save_best_checkpoint(
+    rl_status: Dict,
+    val_rewards: List[float],
+    rl_checkpoint_dir: Path,
+    best_checkpoint_dir: Path,
+    best_score: List[float],  # single-element mutable holder; updated in place
+) -> None:
+    """Copy the latest RL checkpoint to best_checkpoint_dir if it beats the current best.
+
+    Score = mean(val_rewards) when available.  Falls back to -kl_divergence so that
+    a lower KL (healthier policy) wins when val data has not yet accumulated.
+    The best_checkpoint_dir always holds exactly one checkpoint directory (latest best).
+    A best_meta.json is written alongside it describing the winning score and step.
+    """
+    import shutil
+
+    if val_rewards:
+        current_score: float = statistics.mean(val_rewards)
+        score_basis = "val_reward_mean"
+    else:
+        kl = float(rl_status.get("kl_divergence", 999.0))
+        current_score = -kl  # lower KL → higher (better) score
+        score_basis = "neg_kl_divergence"
+
+    if current_score <= best_score[0]:
+        return  # not an improvement
+
+    ckpt_root = Path(rl_checkpoint_dir)
+    if not ckpt_root.exists():
+        log_line(f"warning best_checkpoint_skip rl_checkpoint_dir_missing={ckpt_root}")
+        return
+
+    candidates = sorted(
+        [p for p in ckpt_root.iterdir() if p.is_dir() and p.name.startswith("checkpoint_")],
+        key=lambda p: p.name,
+    )
+    if not candidates:
+        log_line("warning best_checkpoint_skip no_checkpoints_on_disk")
+        return
+    latest_ckpt = candidates[-1]
+
+    best_dir = Path(best_checkpoint_dir)
+    tmp_dir = best_dir.parent / f".best_checkpoint_tmp_{os.getpid()}"
+    try:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        shutil.copytree(latest_ckpt, tmp_dir)
+        if best_dir.exists():
+            shutil.rmtree(best_dir)
+        tmp_dir.rename(best_dir)
+    except Exception as exc:
+        log_line(f"warning best_checkpoint_copy_failed err={exc}")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
+    best_score[0] = current_score
+    meta = {
+        "source_checkpoint": latest_ckpt.name,
+        "training_step": rl_status.get("training_step"),
+        "kl_divergence": rl_status.get("kl_divergence"),
+        "last_loss": rl_status.get("last_loss"),
+        "score": current_score,
+        "score_basis": score_basis,
+        "val_reward_count": len(val_rewards),
+        "saved_at": utc_now_iso(),
+    }
+    try:
+        (best_dir / "best_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log_line(f"warning best_checkpoint_meta_write_failed err={exc}")
+    log_line(
+        "best_checkpoint_saved "
+        f"source={latest_ckpt.name} step={rl_status.get('training_step')} "
+        f"score={current_score:.5f} basis={score_basis} kl={rl_status.get('kl_divergence'):.4f}"
+    )
+
+
 def median_or_zero(xs: List[float]) -> float:
     return statistics.median(xs) if xs else 0.0
 
@@ -683,10 +771,6 @@ def _rewrite_candidate_viable(args: argparse.Namespace, note_text: str, rewrite:
 
     source = str(rewrite.get("generation_source", "")).lower()
     if "model_load_error" in source:
-        return False
-
-    lowered = rewritten.lower()
-    if not any(k in lowered for k in ("icd", "code", "json", "diagnosis")):
         return False
 
     note_tokens = _tokenize_for_overlap(note_text)
@@ -1533,6 +1617,15 @@ def main() -> int:
             f"every_minutes={float(args.checkpoint_every_minutes):.2f}"
         )
 
+    # Best-checkpoint tracking: single-element list used as a mutable score holder.
+    best_checkpoint_score: List[float] = [-float("inf")]
+    Path(args.best_checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    log_line(
+        "best_checkpoint_tracking_enabled "
+        f"rl_checkpoint_dir={args.rl_checkpoint_dir} "
+        f"best_checkpoint_dir={args.best_checkpoint_dir}"
+    )
+
     note_index = 0
     offset = 0
     train_sample_index = 0
@@ -1553,7 +1646,7 @@ def main() -> int:
 
         pending_train_triggers -= 1
 
-        def _run_one_cycle() -> Tuple[bool, str, float]:
+        def _run_one_cycle() -> Tuple[bool, str, float, Dict]:
             local = _get_thread_session()
             _RL_IO.log_input(action="train_cycle_trigger")
             t0 = now()
@@ -1571,14 +1664,14 @@ def main() -> int:
                     f"queue_pending={qst.get('pending_count')} "
                     f"training_step={st.get('training_step')} "
                     f"rollouts_loaded={st.get('rollouts_loaded')}"
-                ), now() - t0
+                ), now() - t0, st
             except Exception as exc:
                 _RL_IO.log_output(
                     action="train_cycle_trigger",
                     status="failed",
                     error=str(exc),
                 )
-                return False, f"train_cycle_failed err={exc}", now() - t0
+                return False, f"train_cycle_failed err={exc}", now() - t0, {}
 
         stats.train_cycle_attempts += 1
         train_future = train_executor.submit(_run_one_cycle)
@@ -1753,10 +1846,15 @@ def main() -> int:
                     maybe_start_train()
 
                 if train_future is not None and train_future.done():
-                    ok, message, elapsed = train_future.result()
+                    ok, message, elapsed, cycle_status = train_future.result()
                     timings.train_cycle_sec.append(elapsed)
                     if ok:
                         stats.train_cycle_success_count += 1
+                        _maybe_save_best_checkpoint(
+                            cycle_status, val_rewards,
+                            Path(args.rl_checkpoint_dir), Path(args.best_checkpoint_dir),
+                            best_checkpoint_score,
+                        )
                     else:
                         train_cycle_failures.append(message)
                     log_line(message)
@@ -1833,10 +1931,15 @@ def main() -> int:
                         maybe_start_train()
 
                     if train_future is not None and train_future.done():
-                        ok, message, elapsed = train_future.result()
+                        ok, message, elapsed, cycle_status = train_future.result()
                         timings.train_cycle_sec.append(elapsed)
                         if ok:
                             stats.train_cycle_success_count += 1
+                            _maybe_save_best_checkpoint(
+                                cycle_status, val_rewards,
+                                Path(args.rl_checkpoint_dir), Path(args.best_checkpoint_dir),
+                                best_checkpoint_score,
+                            )
                         else:
                             train_cycle_failures.append(message)
                         log_line(message)
@@ -1933,10 +2036,15 @@ def main() -> int:
                 time.sleep(0.2)
                 continue
             if train_future.done():
-                ok, message, elapsed = train_future.result()
+                ok, message, elapsed, cycle_status = train_future.result()
                 timings.train_cycle_sec.append(elapsed)
                 if ok:
                     stats.train_cycle_success_count += 1
+                    _maybe_save_best_checkpoint(
+                        cycle_status, val_rewards,
+                        Path(args.rl_checkpoint_dir), Path(args.best_checkpoint_dir),
+                        best_checkpoint_score,
+                    )
                 else:
                     train_cycle_failures.append(message)
                 log_line(message)

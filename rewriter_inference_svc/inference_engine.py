@@ -22,6 +22,7 @@ from .config import (
     MAX_RAW_NOTE_CHARS,
     MAX_NEW_TOKENS,
     MAX_NEW_TOKENS_HARD_CAP,
+    MIN_REWRITE_CHARS,
     OUTPUT_PATH,
     TEMPERATURE,
     TOP_K,
@@ -92,7 +93,7 @@ _rewrite_rejection_counts: Counter[str] = Counter()
 _LOGIT_CLAMP_MIN = -50.0
 _LOGIT_CLAMP_MAX = 50.0
 _MIN_RETRY_NEW_TOKENS = 32
-_MIN_REWRITE_CHARS = 64
+_MIN_REWRITE_CHARS = MIN_REWRITE_CHARS
 _MAX_REWRITE_CHARS = 420
 _STRICT_MINIMAL_FALLBACK = (
     "Extract all supported ICD-10-CM diagnosis codes from this case. "
@@ -525,7 +526,7 @@ def _generate_rewrite(
     note_text: str,
     policy: PromptPolicy,
     sampling_nonce: Optional[int] = None,
-) -> Optional[Tuple[str, torch.Tensor, int, torch.Tensor]]:
+) -> Optional[Tuple[str, torch.Tensor, int, torch.Tensor, float]]:
     device = next(model.parameters()).device
     input_ids, attention_mask = _build_prompt_inputs(tokenizer, note_text, policy, device)
     token_cap = _effective_prompt_token_cap(tokenizer)
@@ -580,7 +581,10 @@ def _generate_rewrite(
                             generate_kwargs["top_k"] = int(TOP_K)
                         generate_kwargs["num_beams"] = 1
 
-                    generated_ids = model.generate(**generate_kwargs)
+                    generate_kwargs["output_scores"] = True
+                    generate_kwargs["return_dict_in_generate"] = True
+                    gen_output = model.generate(**generate_kwargs)
+                    generated_ids = gen_output.sequences
 
             if generated_ids.shape[1] <= input_length:
                 log.warning(
@@ -591,8 +595,27 @@ def _generate_rewrite(
                 )
                 continue
 
+            # Compute log_prob_old directly from generation scores (no extra forward pass).
+            # gen_output.scores is a tuple of (vocab_size,) tensors, one per generated step.
+            log_prob_old_from_scores: float = -1e-6
+            try:
+                scores_list = gen_output.scores  # tuple of [1, vocab_size] per step
+                generated_tok_ids = generated_ids[0, input_length:]  # shape (n_generated,)
+                if scores_list and len(scores_list) == generated_tok_ids.shape[0]:
+                    lp_sum = 0.0
+                    for step_idx, step_scores in enumerate(scores_list):
+                        tok_id = int(generated_tok_ids[step_idx].item())
+                        lp = float(
+                            torch.log_softmax(step_scores[0], dim=-1)[tok_id].item()
+                        )
+                        lp_sum += lp
+                    if lp_sum != 0.0:
+                        log_prob_old_from_scores = lp_sum
+            except Exception as _lp_exc:
+                log.warning("log_prob_from_scores_failed attempt=%d error=%s", attempt_idx, _lp_exc)
+
             rewritten = tokenizer.decode(generated_ids[0, input_length:], skip_special_tokens=True).strip()
-            return rewritten, generated_ids, input_length, input_ids
+            return rewritten, generated_ids, input_length, input_ids, log_prob_old_from_scores
         except Exception as exc:
             log.exception(
                 "generate_attempt_failed | attempt=%d token_budget=%d temp=%.3f strategy=%s error=%s",
@@ -609,7 +632,7 @@ def _generate_rewrite(
 def _compute_log_prob(model: PreTrainedModel, full_input_ids: torch.Tensor, input_length: int) -> float:
     with _inference_lock:
         with torch.no_grad():
-            outputs = model(full_input_ids)
+            outputs = model(full_input_ids, use_cache=False)
             logits = outputs.logits[:, :-1, :]
             log_probs = torch.log_softmax(logits, dim=-1)
 
@@ -654,9 +677,9 @@ def _generate_rewrite_batch(
     notes: list[str],
     policies: list[PromptPolicy],
     sampling_nonces: list[Optional[int]],
-) -> list[Optional[str]]:
+) -> Tuple[list[Optional[str]], list[float]]:
     if not notes:
-        return []
+        return [], []
 
     device = next(model.parameters()).device
     token_cap = _effective_prompt_token_cap(tokenizer)
@@ -702,18 +725,45 @@ def _generate_rewrite_batch(
             generate_kwargs["top_k"] = int(TOP_K)
         generate_kwargs["num_beams"] = 1
 
+    generate_kwargs["output_scores"] = True
+    generate_kwargs["return_dict_in_generate"] = True
     with _inference_lock:
         with torch.no_grad():
-            generated = model.generate(**generate_kwargs)
+            gen_output = model.generate(**generate_kwargs)
+
+    generated = gen_output.sequences
+    scores_list = gen_output.scores  # tuple of per-step [batch, vocab_size] tensors
 
     rewrites: list[Optional[str]] = []
+    log_probs_old: list[float] = []
     for row_idx, input_len in enumerate(input_lengths):
         if generated.shape[1] <= input_len:
             rewrites.append(None)
+            log_probs_old.append(-1e-6)
             continue
         text = tokenizer.decode(generated[row_idx, input_len:], skip_special_tokens=True).strip()
         rewrites.append(text)
-    return rewrites
+        # Compute per-sequence log_prob_old from generation scores.
+        # Padding layout: generated = [right-padded input (max_len)] [new tokens (n_scores)]
+        # Generated tokens always start at max_len = generated.shape[1] - n_scores for ALL rows,
+        # regardless of per-row input_len (which is the UNPADDED length, not max_len).
+        # Using input_len as the start would slice into right-padding tokens for shorter inputs.
+        lp_old: float = -1e-6
+        try:
+            n_scores = len(scores_list)
+            if scores_list and n_scores > 0:
+                padded_input_len = generated.shape[1] - n_scores  # == max_len for all rows
+                generated_tok_ids = generated[row_idx, padded_input_len : padded_input_len + n_scores]
+                lp_sum = 0.0
+                for step_idx, step_scores in enumerate(scores_list):
+                    tok_id = int(generated_tok_ids[step_idx].item())
+                    lp_sum += float(torch.log_softmax(step_scores[row_idx], dim=-1)[tok_id].item())
+                if lp_sum != 0.0:
+                    lp_old = lp_sum
+        except Exception as _lp_exc:
+            log.warning("batch_log_prob_from_scores_failed row=%d error=%s", row_idx, _lp_exc)
+        log_probs_old.append(lp_old)
+    return rewrites, log_probs_old
 
 
 def _compute_value_estimate(model: PreTrainedModel, value_head: torch.nn.Module, input_ids: torch.Tensor) -> float:
@@ -893,6 +943,7 @@ def run_inference(
     full_ids: Optional[torch.Tensor] = None
     input_length = 0
     prompt_ids: Optional[torch.Tensor] = None
+    log_prob_old: float = -1e-6
 
     if cached_rewrite and _is_valid_rewrite(_sanitize_generated_rewrite(cached_rewrite), rule_prompt):
         rewritten_prompt = _sanitize_generated_rewrite(cached_rewrite)
@@ -916,7 +967,7 @@ def run_inference(
             )
             if first_result is None:
                 continue
-            first_raw, full_1, in_len_1, prompt_1 = first_result
+            first_raw, full_1, in_len_1, prompt_1, lp_from_gen = first_result
             first = _sanitize_generated_rewrite(first_raw)
             if first != first_raw:
                 full_1, in_len_1, prompt_1 = _build_full_sequence_safe(
@@ -926,6 +977,7 @@ def run_inference(
                     candidate,
                     device,
                 )
+                lp_from_gen = -1e-6  # rewrite changed after sanitise; scores no longer valid
             if _is_valid_rewrite(first, rule_prompt):
                 rewritten_prompt = first
                 chosen_policy = candidate
@@ -933,6 +985,7 @@ def run_inference(
                 full_ids = full_1
                 input_length = in_len_1
                 prompt_ids = prompt_1
+                log_prob_old = lp_from_gen
                 break
             rejection_reason = _rewrite_rejection_reason(first, rule_prompt)
 
@@ -976,21 +1029,22 @@ def run_inference(
             device,
         )
 
-    log_prob_old = -1e-6
-    if full_ids is not None:
+    # log_prob_old is already set from generation scores for model_first path;
+    # for fallback paths, attempt _compute_log_prob as a last resort.
+    if log_prob_old == -1e-6 and full_ids is not None:
         try:
-            log_prob_old = _compute_log_prob(model, full_ids, input_length)
-            if log_prob_old == 0.0:
-                log_prob_old = -1e-6
-        except Exception:
-            log_prob_old = -1e-6
+            computed = _compute_log_prob(model, full_ids, input_length)
+            if computed != 0.0:
+                log_prob_old = computed
+        except Exception as _lp_exc:
+            log.warning("log_prob_fallback_forward_failed note_id=%s error=%s", note_id, _lp_exc)
 
     value_estimate = 0.0
     if prompt_ids is not None:
         try:
             value_estimate = _compute_value_estimate(model, value_head, prompt_ids)
-        except Exception:
-            value_estimate = 0.0
+        except Exception as _ve_exc:
+            log.warning("value_estimate_failed note_id=%s error=%s", note_id, _ve_exc)
 
     _record_group_strategy(note_id, model_input_text, chosen_policy.template_name)
 
@@ -1148,20 +1202,24 @@ def run_inference_batch(requests: list[dict[str, Any]]) -> list[Dict[str, Any]]:
         policies = [entry["chosen_policy"] for entry in pending_for_batch]
         nonces = [entry["nonce"] for entry in pending_for_batch]
 
-        batch_raw = _generate_rewrite_batch(model, tokenizer, notes, policies, nonces)
+        batch_raw, batch_lp_olds = _generate_rewrite_batch(model, tokenizer, notes, policies, nonces)
 
-        for entry, raw in zip(pending_for_batch, batch_raw):
+        for entry, raw, lp_batch in zip(pending_for_batch, batch_raw, batch_lp_olds):
             rewritten_prompt = ""
             generation_source = "model_first"
             chosen_policy = entry["chosen_policy"]
             rejection_reason: Optional[str] = None
+            log_prob_old: float = lp_batch  # from generation scores
 
             if raw is not None:
                 candidate = _sanitize_generated_rewrite(raw)
                 if _is_valid_rewrite(candidate, entry["rule_prompt"]):
                     rewritten_prompt = candidate
+                    if raw != candidate:
+                        log_prob_old = -1e-6  # sanitisation changed text; scores invalid
                 else:
                     rejection_reason = _rewrite_rejection_reason(candidate, entry["rule_prompt"])
+                    log_prob_old = -1e-6
 
             if not rewritten_prompt:
                 retry_result = _generate_rewrite(
@@ -1172,11 +1230,12 @@ def run_inference_batch(requests: list[dict[str, Any]]) -> list[Dict[str, Any]]:
                     sampling_nonce=entry["nonce"],
                 )
                 if retry_result is not None:
-                    retry_raw, _, _, _ = retry_result
+                    retry_raw, _, _, _, retry_lp = retry_result
                     retry_candidate = _sanitize_generated_rewrite(retry_raw)
                     if _is_valid_rewrite(retry_candidate, entry["rule_prompt"]):
                         rewritten_prompt = retry_candidate
                         generation_source = "model_retry"
+                        log_prob_old = retry_lp if retry_raw == retry_candidate else -1e-6
                     else:
                         rejection_reason = _rewrite_rejection_reason(retry_candidate, entry["rule_prompt"])
 
@@ -1202,21 +1261,27 @@ def run_inference_batch(requests: list[dict[str, Any]]) -> list[Dict[str, Any]]:
                 chosen_policy,
                 device,
             )
-            log_prob_old = -1e-6
-            if full_ids is not None:
+            # Fall back to forward-pass log prob only if generation scores weren't available.
+            if log_prob_old == -1e-6 and full_ids is not None:
                 try:
-                    log_prob_old = _compute_log_prob(model, full_ids, input_length)
-                    if log_prob_old == 0.0:
-                        log_prob_old = -1e-6
-                except Exception:
-                    log_prob_old = -1e-6
+                    computed = _compute_log_prob(model, full_ids, input_length)
+                    if computed != 0.0:
+                        log_prob_old = computed
+                except Exception as _lp_exc:
+                    log.warning(
+                        "batch_log_prob_fallback_failed note_id=%s error=%s",
+                        entry.get("note_id"), _lp_exc,
+                    )
 
             value_estimate = 0.0
             if prompt_ids is not None:
                 try:
                     value_estimate = _compute_value_estimate(model, value_head, prompt_ids)
-                except Exception:
-                    value_estimate = 0.0
+                except Exception as _ve_exc:
+                    log.warning(
+                        "batch_value_estimate_failed note_id=%s error=%s",
+                        entry.get("note_id"), _ve_exc,
+                    )
 
             _record_group_strategy(entry.get("note_id"), entry["model_input_text"], chosen_policy.template_name)
             responses[int(entry["global_idx"])] = {

@@ -214,7 +214,6 @@ def load_model() -> Tuple[PreTrainedModel, PreTrainedTokenizerBase, nn.Module]:
             MODEL_NAME,
             quantization_config=bnb_config,
             device_map={"": 0},
-            low_cpu_mem_usage=False,
             torch_dtype=torch.float16,
             trust_remote_code=True,
         )

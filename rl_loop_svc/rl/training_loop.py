@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -289,6 +290,8 @@ class TrainingLoop:
                     self.batch_counter += 1
                     self._fill_buffer(group_items)
                     pre_step = int(self.training_step)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     self._run_ppo_epochs(
                         sbmi_iteration_index=mbmi_epoch + 1,
                         sbmi_iteration_total=max(settings.mbmi_epochs, 1),
@@ -310,6 +313,8 @@ class TrainingLoop:
                 pre_step = int(self.training_step)
                 sbmi_iters = max(settings.sbmi_epochs, 1) if settings.sbmi_enabled else 1
                 for sbmi_iter in range(sbmi_iters):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     self._run_ppo_epochs(
                         sbmi_iteration_index=sbmi_iter + 1,
                         sbmi_iteration_total=sbmi_iters,
@@ -335,6 +340,42 @@ class TrainingLoop:
 
     # ── Buffer fill with ValueHead inference ────────────────────────────────
 
+    def _recompute_log_probs_old(self, entries: List[RolloutEntry]) -> List[float]:
+        """Recompute log_prob_old from the frozen reference model.
+
+        The rewriter service stores log_prob_old ≈ -1e-6 (an SFT dummy that is
+        not a real log-probability).  Using this dummy makes the PPO IS ratio
+        degenerate — exp(lp_policy - (-1e-6/action_len)) is anchored to the
+        wrong baseline.  By computing log_prob_old fresh from the reference model
+        we get a correct per-token baseline that tracks the SFT initialisation
+        and makes the importance-sampling ratio well-defined from the first cycle.
+        """
+        if self.reference_model is None or self.policy_model is None:
+            return [float(e.log_prob_old) for e in entries]
+
+        originals = [e.original_prompt for e in entries]
+        rewrittens = [e.rewritten_prompt for e in entries]
+        log_probs: List[float] = []
+
+        self.reference_model.eval() if hasattr(self.reference_model, "eval") else None
+        with torch.no_grad():
+            for start in range(0, len(entries), settings.batch_size):
+                batch_orig = originals[start : start + settings.batch_size]
+                batch_rew = rewrittens[start : start + settings.batch_size]
+                tokenized = self.policy_model.tokenize_with_action_mask(
+                    batch_orig, batch_rew
+                )
+                mb_ids = tokenized["input_ids"]
+                mb_mask = tokenized.get("attention_mask")
+                mb_action = tokenized["action_mask"]
+                mb_fused = _fuse_action_attention_mask(mb_action, mb_mask)
+                ref_lp = self.reference_model.get_sequence_log_prob(
+                    mb_ids, mb_mask, mb_fused
+                )
+                log_probs.extend(ref_lp.detach().cpu().tolist())
+
+        return log_probs
+
     def _fill_buffer(self, entries: List[RolloutEntry]) -> None:
         self.buffer.clear()
 
@@ -342,11 +383,15 @@ class TrainingLoop:
         rewrittens = [e.rewritten_prompt for e in entries]
 
         value_estimates = self._compute_value_estimates(originals)
+        # Recompute log_prob_old from the frozen reference model so the PPO
+        # importance-sampling ratio is correctly anchored to the SFT baseline,
+        # not the dummy -1e-6 stored by the rewriter service.
+        log_probs_old = self._recompute_log_probs_old(entries)
 
         for idx, entry in enumerate(entries):
             self.buffer.store(
                 reward=entry.reward,
-                log_prob_old=entry.log_prob_old,
+                log_prob_old=log_probs_old[idx],
                 value_estimate=value_estimates[idx],
                 original_prompt=entry.original_prompt,
                 rewritten_prompt=entry.rewritten_prompt,
@@ -583,16 +628,23 @@ class TrainingLoop:
         ref_log_probs = torch.cat(ref_chunks_cpu, dim=0).to(self.policy_model.device)
 
         # ── LR scheduler for this training cycle ────────────────────────────
+        # Reset the scheduler each cycle so that warmup_steps and total_steps
+        # reflect the actual batch size for THIS cycle, not the first one.
+        # Keeping a stale scheduler from cycle 1 (e.g. 9 rollouts) through cycle 5
+        # (e.g. 182 rollouts) means the LR was computed against wrong total_steps,
+        # causing either premature decay or no warmup on later cycles.
         total_steps = settings.ppo_epochs * max(
             1,
             math.ceil(n / settings.batch_size) // settings.gradient_accumulation_steps,
         )
         warmup_steps = max(1, int(total_steps * settings.lr_warmup_ratio))
-        if self.scheduler is None and total_steps > 1:
+        if total_steps > 1:
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
                 lr_lambda=self._build_warmup_cosine_lambda(warmup_steps, total_steps),
             )
+        else:
+            self.scheduler = None
 
         # ── Epoch loop (only gradient updates, everything else precomputed) ─
         min_epochs = max(1, int(settings.dynamic_min_epochs))
@@ -709,12 +761,22 @@ class TrainingLoop:
                 )
                 seq_log_prob_new = (token_log_probs_new * mb_fused).sum(dim=-1)
 
-                # Entropy regularization from the logits distribution
+                # Per-token action length — used to normalise entropy, KL, and GRPO
+                # loss so that long and short notes contribute equally regardless of
+                # sequence length.  Clamp at 1 to avoid division-by-zero on empty
+                # action spans (those are filtered above, but be defensive).
+                action_len = mb_fused.sum(dim=-1).clamp(min=1.0)          # (B,)
+                seq_log_prob_new_per_tok = seq_log_prob_new / action_len   # (B,)
+
+                # Entropy regularization: average over action tokens, not sum.
+                # Summing over 150 tokens with vocab ~32K yields ~1500 nats/sample,
+                # making the entropy term dominate the loss and drive it deeply
+                # negative.  Per-token average keeps it in the ~2-10 nat range.
                 token_probs = F.softmax(logits, dim=-1)
                 token_entropy = -(token_probs * torch.log(token_probs + 1e-10)).sum(
                     dim=-1
                 )
-                seq_entropy = (token_entropy * mb_fused).sum(dim=-1)
+                seq_entropy = (token_entropy * mb_fused).sum(dim=-1) / action_len  # per-token avg
                 mb_entropy = seq_entropy.mean()
 
                 # Value head loss
@@ -741,11 +803,23 @@ class TrainingLoop:
                     )
                     continue
 
-                ratio = torch.exp(seq_log_prob_new - old_log_prob_mb)
+                # PPO importance-sampling ratio: normalise both log-probs by
+                # action_len before computing the ratio.  The SFT rewriter stores
+                # log_prob_old ≈ -1e-6 (a near-zero dummy); without normalisation the
+                # ratio collapses to exp(seq_log_prob_new) ≈ exp(-75) ≈ 0, making
+                # the PPO surrogate degenerate.  Per-token normalisation ensures the
+                # ratio stays ~O(1) and the PPO path contributes meaningful gradients
+                # once the policy drifts from the SFT initialisation.
+                old_log_prob_mb_per_tok = old_log_prob_mb / action_len
+                ratio = torch.exp(seq_log_prob_new_per_tok - old_log_prob_mb_per_tok)
                 ratio = torch.clamp(ratio, 0.0, settings.ratio_clip_max)
 
+                # KL: computed on per-token log-probs so that the divergence is
+                # sequence-length-independent and comparable to the
+                # RL_MAX_ABS_KL_FOR_UPDATE threshold (which is expressed per-token).
                 ref_mb = ref_log_probs[start:end].to(seq_log_prob_new.device)
-                kl_penalty = self.kl_controller.compute_kl(seq_log_prob_new, ref_mb)
+                ref_mb_per_tok = ref_mb / action_len
+                kl_penalty = self.kl_controller.compute_kl(seq_log_prob_new_per_tok, ref_mb_per_tok)
 
                 adv_mb = current_batch.advantages[start:end].to(seq_log_prob_new.device)
                 fallback_mb = current_fallback_mask[start:end].to(seq_log_prob_new.device)
@@ -755,7 +829,9 @@ class TrainingLoop:
                 )
                 normalizer = torch.clamp(sample_weights.sum(), min=1e-8)
 
-                grpo_loss_per_sample = -(adv_mb * seq_log_prob_new)
+                # GRPO policy gradient: use per-token log-prob so gradient magnitude
+                # is note-length-independent (long notes no longer dominate).
+                grpo_loss_per_sample = -(adv_mb * seq_log_prob_new_per_tok)
                 ppo_surr1 = ratio * adv_mb
                 ppo_surr2 = (
                     torch.clamp(ratio, 1.0 - settings.epsilon, 1.0 + settings.epsilon)
@@ -798,7 +874,7 @@ class TrainingLoop:
                 ):
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         list(self.policy_model.parameters()),
-                        max_norm=1.0,
+                        max_norm=settings.grad_clip_max_norm,
                     )
                     self.optimizer.step()
                     if self.scheduler is not None:
@@ -866,6 +942,10 @@ class TrainingLoop:
                 if epoch_loss_count > 0
                 else None
             )
+            # Store epoch-mean loss rather than the last minibatch loss so that
+            # checkpoint health metrics (last_loss) reflect the full epoch average.
+            if epoch_avg_loss is not None:
+                self.last_loss = epoch_avg_loss
 
             # KL early stopping
             if self.kl_controller.last_kl > settings.max_abs_kl_for_update:
@@ -989,14 +1069,29 @@ class TrainingLoop:
         )
 
     def _notify_rewriter_reload(self) -> None:
-        rewriter_service_url = os.environ.get(
-            "REWRITER_SERVICE_URL", "http://localhost:8000"
-        )
-        endpoint = f"{rewriter_service_url}/reload_checkpoint"
-        try:
-            requests.post(endpoint, timeout=30)
-        except requests.RequestException as exc:
-            logger.warning("Failed to notify rewriter checkpoint reload: %s", exc)
+        # Notify all rewriter replicas (primary + secondary) so every replica
+        # loads the latest checkpoint.  REWRITER_SERVICE_URLS is a
+        # comma-separated list; fall back to REWRITER_SERVICE_URL (singular)
+        # for backward compatibility, then to the hardcoded default.
+        urls_env = os.environ.get("REWRITER_SERVICE_URLS", "")
+        if not urls_env:
+            urls_env = os.environ.get("REWRITER_SERVICE_URL", "http://localhost:8000")
+        rewriter_urls = [u.strip() for u in urls_env.split(",") if u.strip()]
+
+        def _fire(url: str) -> None:
+            endpoint = f"{url}/reload_checkpoint"
+            try:
+                requests.post(endpoint, timeout=30)
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Failed to notify rewriter checkpoint reload at %s: %s", url, exc
+                )
+
+        # Fire-and-forget: do not block the CHECKPOINT→IDLE transition while
+        # rewriter services are GPU-busy (each reload call can take up to 30s).
+        for url in rewriter_urls:
+            t = threading.Thread(target=_fire, args=(url,), daemon=True)
+            t.start()
 
     # ── Distributed training ────────────────────────────────────────────────
 

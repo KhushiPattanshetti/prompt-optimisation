@@ -34,3 +34,5 @@ VALUE_HEAD_HIDDEN_SIZE: int = 3072
 
 BEST_PROMPT_CACHE_THRESHOLD: float = 0.0
 BEST_PROMPT_CACHE_FILE: Path = PROJECT_ROOT / "best_prompts_cache" / "cache.json"
+
+MIN_REWRITE_CHARS: int = int(os.getenv("REWRITER_MIN_REWRITE_CHARS", "20"))

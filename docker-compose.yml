@@ -1,9 +1,9 @@
 services:
   dataset_svc:
     build: .
-    container_name: dataset_svc
+    container_name: v3_dataset_svc
     command: uvicorn dataset_svc.app:app --host 0.0.0.0 --port 8003
-    ports: ["8003:8003"]
+    ports: ["9003:8003"]
     volumes:
       - ./data:/app/data
       - ./run_results:/app/run_results
@@ -20,13 +20,14 @@ services:
 
   rewriter_svc:
     build: .
-    container_name: rewriter_svc
+    container_name: v3_rewriter_svc
     command: uvicorn rewriter_inference_svc.app:app --host 0.0.0.0 --port 8000
-    ports: ["8000:8000"]
+    ports: ["9000:8000"]
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
       - ./rl_checkpoints:/app/rl_checkpoints
+      - ./best_checkpoint:/app/best_checkpoint # best-performing weights; used for demo
       - ./sft_checkpoints:/app/sft_checkpoints
       - ./inference_outputs:/app/inference_outputs
       - ./best_prompts_cache:/app/best_prompts_cache
@@ -68,13 +69,14 @@ services:
 
   rewriter_svc_b:
     build: .
-    container_name: rewriter_svc_b
+    container_name: v3_rewriter_svc_b
     command: uvicorn rewriter_inference_svc.app:app --host 0.0.0.0 --port 8005
-    ports: ["8005:8005"]
+    ports: ["9005:8005"]
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
       - ./rl_checkpoints:/app/rl_checkpoints
+      - ./best_checkpoint:/app/best_checkpoint # best-performing weights; used for demo
       - ./sft_checkpoints:/app/sft_checkpoints
       - ./inference_outputs:/app/inference_outputs
       - ./best_prompts_cache:/app/best_prompts_cache
@@ -116,9 +118,9 @@ services:
 
   icd10_svc:
     build: .
-    container_name: icd10_svc
+    container_name: v3_icd10_svc
     command: uvicorn icd10_coding_svc.app:app --host 0.0.0.0 --port 8001
-    ports: ["8001:8001"]
+    ports: ["9001:8001"]
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
@@ -154,9 +156,9 @@ services:
 
   reward_svc:
     build: .
-    container_name: reward_svc
+    container_name: v3_reward_svc
     command: uvicorn reward_metrics_svc.main:app --host 0.0.0.0 --port 8002
-    ports: ["8002:8002"]
+    ports: ["9002:8002"]
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
@@ -165,9 +167,9 @@ services:
     environment:
       - PYTHONPATH=/app
       - RL_BLOCK_ENDPOINT=http://rl_loop_svc:8004/rollout
-      - RL_SERVICE_URL=http://rl_loop_svc:8004/ingest_rollout
+      - RL_SERVICE_URL=http://rl_loop_svc:8004/rollout
       - ROLLOUT_QUEUE_DIR=/app/reward_queue
-      - ROLLOUT_REQUIRE_PARSE_COMPARABILITY=${ROLLOUT_REQUIRE_PARSE_COMPARABILITY:-true}
+      - ROLLOUT_REQUIRE_PARSE_COMPARABILITY=${ROLLOUT_REQUIRE_PARSE_COMPARABILITY:-false} # §6.3: false preserves reward signal without silently dropping rollouts
       - PIPELINE_LOGS_DIR=/app/pipeline_logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
@@ -178,9 +180,9 @@ services:
 
   rl_loop_svc:
     build: .
-    container_name: rl_loop_svc
+    container_name: v3_rl_loop_svc
     command: uvicorn rl_loop_svc.app.main:app --host 0.0.0.0 --port 8004
-    ports: ["8004:8004"]
+    ports: ["9004:8004"]
     volumes:
       - ./data:/app/data
       - ./hf_cache:/app/hf_cache
@@ -191,6 +193,7 @@ services:
       - PYTHONPATH=/app
       - RL_CHECKPOINT_DIR=/app/rl_checkpoints
       - REWRITER_SERVICE_URL=http://rewriter_svc:8000
+      - REWRITER_SERVICE_URLS=http://rewriter_svc:8000,http://rewriter_svc_b:8005
       - HF_HOME=/app/hf_cache
       - NVIDIA_VISIBLE_DEVICES=2
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -198,9 +201,20 @@ services:
       - RL_HIDDEN_SIZE=3072
       - RL_POLICY_CUDA_DEVICE=0
       - RL_REFERENCE_CUDA_DEVICE=0
-      - RL_BATCH_SIZE=${RL_BATCH_SIZE:-2}
-      - RL_GRADIENT_ACCUMULATION_STEPS=8
+      - RL_BATCH_SIZE=${RL_BATCH_SIZE:-2} # §OOM-fix: reduced from 4 to 2 to halve peak activation memory
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # §OOM-fix: avoid fragmentation during training
+      - RL_GRADIENT_ACCUMULATION_STEPS=${RL_GRADIENT_ACCUMULATION_STEPS:-8} # §7 Tier 1: 8
+      - RL_SBMI_EPOCHS=${RL_SBMI_EPOCHS:-4} # §7 Tier 1: 4
+      - RL_MAX_ABS_KL_FOR_UPDATE=${RL_MAX_ABS_KL_FOR_UPDATE:-0.5} # §bug3-fix: tightened from 1.0; abort cycle earlier before KL compounds
+      - RL_VALUE_COEF=${RL_VALUE_COEF:-0.0} # §bug2-fix: value_estimate=0.0 for all notes (4-bit model hidden states inaccessible); disable value loss until fixed
+      - RL_HYBRID_MODE_ENFORCED=${RL_HYBRID_MODE_ENFORCED:-false} # §bug2-fix: disable strict hybrid assertion; value_head path is already gated by has_value_estimates=False
+      - RL_GRAD_CLIP_MAX_NORM=${RL_GRAD_CLIP_MAX_NORM:-0.1} # per-token loss scale is ~150x smaller; 0.1 is effective; was hardcoded 1.0
+      - RL_ENTROPY_COEF=${RL_ENTROPY_COEF:-0.001} # was 0.01; reduced because entropy is now per-token (not summed)
+      - RL_LEARNING_RATE=${RL_LEARNING_RATE:-5e-6} # §bug3-fix: halved from 1e-5; smaller steps reduce collapse risk now that value loss is disabled
+      - RL_KL_BETA=${RL_KL_BETA:-0.05} # §KL-fix: raised from 0.01 (was too small to meaningfully penalise KL)
+      - RL_GRPO_MIN_GROUP_SIZE=${RL_GRPO_MIN_GROUP_SIZE:-3} # §7 Tier 2: raised from 2 (warmup complete)
       - RL_POLICY_MAX_LENGTH=${RL_POLICY_MAX_LENGTH:-768}
+      - RL_MAX_CHECKPOINTS=${RL_MAX_CHECKPOINTS:-100} # retain all cycles; never auto-prune training history
       - RL_DISTRIBUTED_ENABLED=false
       - RL_DISTRIBUTED_WORLD_SIZE=4
       - RL_DISTRIBUTED_MIN_FREE_RAM_GB=64
@@ -211,7 +225,7 @@ services:
       - RL_PPO_DEBUG_DISABLE_INVALID_SPAN_SKIP=${RL_PPO_DEBUG_DISABLE_INVALID_SPAN_SKIP:-false}
       - RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION=${RL_PPO_DEBUG_DISABLE_REWARD_NORMALIZATION:-false}
       - RL_PPO_DEBUG_CLAMP_ADVANTAGES=${RL_PPO_DEBUG_CLAMP_ADVANTAGES:-false}
-      - RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS=${RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS:-false}
+      - RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS=${RL_PPO_DEBUG_DISABLE_ROLLOUT_FILTERS:-false} # §6.6: false now that training_step > 15; ICD-code contamination filter active
       - PIPELINE_LOGS_DIR=/app/pipeline_logs
     depends_on:
       dataset_svc:

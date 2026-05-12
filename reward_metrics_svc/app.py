@@ -148,14 +148,10 @@ def compute_reward_endpoint(req: RewardRequest) -> RewardResponse:
     update_aggregate_stats(reward, metrics["delta_D"])
 
     # ── 8. Rollout queue (spec §16) ───────────────────────────────────────────
-    enqueue_rollout(
-        note_id=req.note_id,
-        state=req.state,
-        action=req.action,
-        reward=reward,
-        log_prob_old=req.log_prob_old,
-        value_estimate=req.value_estimate,
-    )
+    # Rollout submission is handled exclusively by the orchestrator via /rollout_batch
+    # (which includes the mandatory group_id for Hybrid GRPO enforcement).
+    # Direct per-call submission from reward_svc is disabled: it lacks group_id and
+    # causes duplicate entries that break Hybrid enforcement ("group_id missing" error).
 
     # ── 9. Pretty I/O log ────────────────────────────────────────────────────
     if _PRETTY_LOG:

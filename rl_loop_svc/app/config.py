@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     value_coef: float = 0.5
     value_clip: float = 0.2
     entropy_coef: float = 0.01
-    beta: float = 0.01
+    beta: float = float(os.environ.get("RL_KL_BETA", "0.05"))  # §KL-fix: was hardcoded 0.01; now env-overridable
     max_abs_kl_for_update: float = 100.0
     normalize_rewards: bool = True
 
@@ -43,8 +43,9 @@ class Settings(BaseSettings):
     learning_rate: float = 3e-5
     lr_warmup_ratio: float = 0.1
     lr_min_ratio: float = 0.1
-    max_checkpoints: int = 5
+    max_checkpoints: int = 100  # high default; always overridable via RL_MAX_CHECKPOINTS env var
     ratio_clip_max: float = 10.0
+    grad_clip_max_norm: float = 0.1  # per-token normalised losses are ~150x smaller; 0.1 keeps effective clipping meaningful
 
     model_name: str = "ishanmane/phi3-rewriter-sft"
     hidden_size: int = 3072
